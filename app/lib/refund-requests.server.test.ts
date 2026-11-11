@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { db } from "~/db";
 import {
   categories,
+  coupons,
   courses,
   CourseStatus,
   lessonProgress,
@@ -10,15 +11,25 @@ import {
   lessons,
   modules,
   purchases,
+  RefundMoneyStatus,
   refunds,
   RefundRequestEventType,
   RefundStatus,
+  teams,
   users,
   UserRole,
   videoWatchEvents,
 } from "~/db/schema";
+import {
+  countEnrollmentsForCourse,
+  enroll,
+  findSuspendedEnrollment,
+  isEnrolled,
+  listEnrolledCoursesForUser,
+} from "~/lib/enrollments.server";
 import { useTestDatabase } from "~/test/db";
 import {
+  approveRefundRequest,
   countOpenRefundRequests,
   declineRefundRequest,
   getRefundRequestAuditTrail,
@@ -557,5 +568,214 @@ describe("declineRefundRequest", () => {
     expect(() =>
       declineRefundRequest(999, ada.id, { reason: "Why not." }, decidedAt)
     ).toThrow(expect.objectContaining({ init: { status: 404 } }));
+  });
+});
+
+describe("approveRefundRequest", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const decidedAt = new Date("2026-01-05T09:30:00.000Z");
+
+  function setUp() {
+    const { liam, course } = seedBasics();
+    const ada = createUser("Ada", UserRole.Admin);
+    enroll(liam.id, course.id);
+    const purchase = createPurchase(liam.id, course.id, 7900);
+    const request = createRefundRequest(purchase.id);
+    return { liam, course, ada, purchase, request };
+  }
+
+  function silenceEmailLog() {
+    return vi.spyOn(console, "log").mockImplementation(() => {});
+  }
+
+  it("approves an Open Refund Request with a Pending Refund for the full amount paid, and records who approved it", () => {
+    silenceEmailLog();
+    const { ada, request } = setUp();
+
+    const result = approveRefundRequest(
+      request.id,
+      ada.id,
+      { note: "  Fair enough.  " },
+      decidedAt
+    );
+
+    expect(result.outcome).toBe("approved");
+    expect(getRefundRequestDetail(request.id)).toMatchObject({
+      status: RefundStatus.Approved,
+      resolvedAt: "2026-01-05T09:30:00.000Z",
+      refund: { status: RefundMoneyStatus.Pending, amount: 7900 },
+    });
+    expect(getRefundRequestAuditTrail(request.id)).toEqual([
+      {
+        id: expect.any(Number),
+        type: RefundRequestEventType.Approved,
+        note: "Fair enough.",
+        createdAt: "2026-01-05T09:30:00.000Z",
+        actor: { id: ada.id, name: "Ada" },
+      },
+    ]);
+  });
+
+  it("needs no note", () => {
+    silenceEmailLog();
+    const { ada, request } = setUp();
+
+    expect(
+      approveRefundRequest(request.id, ada.id, { note: "" }, decidedAt)
+    ).toMatchObject({ outcome: "approved" });
+    expect(getRefundRequestAuditTrail(request.id)).toMatchObject([
+      { type: RefundRequestEventType.Approved, note: null },
+    ]);
+  });
+
+  it("has no Refund before it is approved", () => {
+    const { request } = setUp();
+    expect(getRefundRequestDetail(request.id)?.refund).toBeNull();
+  });
+
+  it("emails the buyer that their money is on its way, with the amount and course", () => {
+    const log = silenceEmailLog();
+    const { ada, request } = setUp();
+
+    const result = approveRefundRequest(request.id, ada.id, {}, decidedAt);
+
+    if (result.outcome !== "approved") throw new Error(result.outcome);
+    expect(result.email.to).toBe("liam@example.com");
+    expect(result.email.subject).toContain("Introduction to TypeScript");
+    expect(result.email.body).toContain("on its way");
+    expect(result.email.body).toContain("$79");
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining("Introduction to TypeScript")
+    );
+  });
+
+  it("suspends the buyer's Enrollment and keeps their progress", () => {
+    silenceEmailLog();
+    const { ada, liam, course, request } = setUp();
+    const courseLessons = createLessons(course.id, 3);
+    db.insert(lessonProgress)
+      .values(
+        courseLessons.slice(0, 2).map((lesson) => ({
+          userId: liam.id,
+          lessonId: lesson.id,
+          status: LessonProgressStatus.Completed,
+          completedAt: "2026-01-02T10:00:00.000Z",
+        }))
+      )
+      .run();
+
+    approveRefundRequest(request.id, ada.id, {}, decidedAt);
+
+    expect(isEnrolled(liam.id, course.id)).toBe(false);
+    expect(findSuspendedEnrollment(liam.id, course.id)).toMatchObject({
+      userId: liam.id,
+      courseId: course.id,
+      suspendedAt: "2026-01-05T09:30:00.000Z",
+    });
+    expect(getRefundRequestDetail(request.id)?.lessonCompletion).toEqual({
+      completedLessons: 2,
+      totalLessons: 3,
+    });
+  });
+
+  it("takes the course off the learner's dashboard and out of the course's learner count", () => {
+    silenceEmailLog();
+    const { ada, liam, course, request } = setUp();
+    const olivia = createUser("Olivia");
+    enroll(olivia.id, course.id);
+
+    approveRefundRequest(request.id, ada.id, {}, decidedAt);
+
+    expect(listEnrolledCoursesForUser(liam.id)).toEqual([]);
+    expect(countEnrollmentsForCourse(course.id)).toBe(1);
+  });
+
+  it("is allowed after the fourteen-day window has closed", () => {
+    silenceEmailLog();
+    const { ada, request } = setUp();
+
+    const result = approveRefundRequest(
+      request.id,
+      ada.id,
+      {},
+      new Date("2026-03-01T10:00:00.000Z")
+    );
+
+    expect(result.outcome).toBe("approved");
+    expect(getRefundRequestDetail(request.id)?.status).toBe(
+      RefundStatus.Approved
+    );
+  });
+
+  it("is rejected for an already-decided request, and changes nothing", () => {
+    const log = silenceEmailLog();
+    const { ada, liam, course, request } = setUp();
+    const bob = createUser("Bob", UserRole.Admin);
+    declineRefundRequest(request.id, bob.id, { reason: "No." }, decidedAt);
+    log.mockClear();
+
+    const result = approveRefundRequest(request.id, ada.id, {}, decidedAt);
+
+    expect(result).toMatchObject({
+      outcome: "already-decided",
+      alreadyDecided: { message: "Already declined by Bob." },
+    });
+    expect(getRefundRequestDetail(request.id)).toMatchObject({
+      status: RefundStatus.Declined,
+      refund: null,
+    });
+    expect(getRefundRequestAuditTrail(request.id)).toHaveLength(1);
+    expect(isEnrolled(liam.id, course.id)).toBe(true);
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it("suspends no Enrollment for a team purchase", () => {
+    silenceEmailLog();
+    const { liam, course } = seedBasics();
+    const ada = createUser("Ada", UserRole.Admin);
+    const boss = createUser("Boss");
+    const purchase = createPurchase(boss.id, course.id, 39500);
+    const team = db.insert(teams).values({}).returning().get();
+    db.insert(coupons)
+      .values([
+        {
+          teamId: team.id,
+          courseId: course.id,
+          code: "SEAT-1",
+          purchaseId: purchase.id,
+          redeemedByUserId: liam.id,
+          redeemedAt: "2026-01-02T10:00:00.000Z",
+        },
+        {
+          teamId: team.id,
+          courseId: course.id,
+          code: "SEAT-2",
+          purchaseId: purchase.id,
+        },
+      ])
+      .run();
+    enroll(liam.id, course.id);
+    enroll(boss.id, course.id);
+    const request = createRefundRequest(purchase.id);
+
+    const result = approveRefundRequest(request.id, ada.id, {}, decidedAt);
+
+    expect(result.outcome).toBe("approved");
+    expect(getRefundRequestDetail(request.id)?.refund).toEqual({
+      status: RefundMoneyStatus.Pending,
+      amount: 39500,
+    });
+    expect(isEnrolled(liam.id, course.id)).toBe(true);
+    expect(isEnrolled(boss.id, course.id)).toBe(true);
+  });
+
+  it("throws a 404 for a Refund Request that does not exist", () => {
+    const ada = createUser("Ada", UserRole.Admin);
+    expect(() => approveRefundRequest(999, ada.id, {}, decidedAt)).toThrow(
+      expect.objectContaining({ init: { status: 404 } })
+    );
   });
 });

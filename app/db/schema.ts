@@ -37,6 +37,15 @@ export enum RefundStatus {
   Declined = "declined",
 }
 
+// Where the money of a Refund stands (see GLOSSARY.md: Pending, Issued and
+// Failed Refund). Null on a Refund Request that has no Refund — Open or
+// Declined.
+export enum RefundMoneyStatus {
+  Pending = "pending",
+  Issued = "issued",
+  Failed = "failed",
+}
+
 // Every step taken on a Refund Request, as recorded in its audit trail.
 export enum RefundRequestEventType {
   Declined = "declined",
@@ -141,6 +150,9 @@ export const enrollments = sqliteTable(
       .notNull()
       .$defaultFn(() => new Date().toISOString()),
     completedAt: text("completed_at"),
+    // Set when the purchase behind the Enrollment is refunded: a Suspended
+    // Enrollment gives no access, but its progress is kept (ADR 0001).
+    suspendedAt: text("suspended_at"),
   },
   (table) => [index("enrollments_course_idx").on(table.courseId)]
 );
@@ -253,6 +265,8 @@ export const refunds = sqliteTable(
     reason: text("reason").notNull(),
     // Null until someone approves — a declined request refunds nothing.
     amountRefunded: integer("amount_refunded"),
+    // The Refund's money state, set to Pending on approval. Null until then.
+    moneyStatus: text("money_status").$type<RefundMoneyStatus>(),
     requestedAt: text("requested_at")
       .notNull()
       .$defaultFn(() => new Date().toISOString()),

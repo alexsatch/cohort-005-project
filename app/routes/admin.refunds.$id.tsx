@@ -3,9 +3,14 @@ import { data, Link, useFetcher } from "react-router";
 import { toast } from "sonner";
 import { z } from "zod";
 import type { Route } from "./+types/admin.refunds.$id";
-import { RefundRequestEventType, RefundStatus } from "~/db/schema";
+import {
+  RefundMoneyStatus,
+  RefundRequestEventType,
+  RefundStatus,
+} from "~/db/schema";
 import { requireAdmin } from "~/lib/access.server";
 import {
+  approveRefundRequest,
   declineRefundRequest,
   getRefundRequestDetail,
   type RefundRequestAuditEntry,
@@ -40,7 +45,7 @@ export async function loader({ params, request }: Route.LoaderArgs) {
 }
 
 const refundRequestIntentSchema = z.object({
-  intent: z.literal("decline"),
+  intent: z.enum(["approve", "decline"]),
 });
 
 export async function action({ params, request }: Route.ActionArgs) {
@@ -55,6 +60,29 @@ export async function action({ params, request }: Route.ActionArgs) {
     throw data("Invalid action.", { status: 400 });
   }
 
+  if (intent.data.intent === "approve") {
+    const result = approveRefundRequest(id, userId, {
+      note: formData.get("note"),
+    });
+
+    switch (result.outcome) {
+      case "invalid":
+        return data(
+          { ok: false as const, errors: result.errors, message: null },
+          { status: 400 }
+        );
+      case "already-decided":
+        return alreadyDecidedResponse(result.alreadyDecided.message);
+      case "approved":
+        return {
+          ok: true as const,
+          errors: null,
+          message:
+            "Refund Request approved. The Refund is pending and the buyer has been emailed.",
+        };
+    }
+  }
+
   const result = declineRefundRequest(id, userId, {
     reason: formData.get("reason"),
   });
@@ -66,14 +94,7 @@ export async function action({ params, request }: Route.ActionArgs) {
         { status: 400 }
       );
     case "already-decided":
-      return data(
-        {
-          ok: false as const,
-          errors: null,
-          message: result.alreadyDecided.message,
-        },
-        { status: 409 }
-      );
+      return alreadyDecidedResponse(result.alreadyDecided.message);
     case "declined":
       return {
         ok: true as const,
@@ -81,6 +102,10 @@ export async function action({ params, request }: Route.ActionArgs) {
         message: "Refund Request declined. The buyer has been emailed.",
       };
   }
+}
+
+function alreadyDecidedResponse(message: string) {
+  return data({ ok: false as const, errors: null, message }, { status: 409 });
 }
 
 function formatDate(iso: string) {
@@ -160,6 +185,51 @@ function DeclineForm() {
     </fetcher.Form>
   );
 }
+
+function ApproveForm() {
+  const fetcher = useFetcher<typeof action>();
+  const [note, setNote] = useState("");
+  const noteError =
+    fetcher.state === "idle" ? fetcher.data?.errors?.note : undefined;
+
+  useEffect(() => {
+    if (fetcher.state !== "idle" || !fetcher.data) return;
+    if (fetcher.data.ok) {
+      toast.success(fetcher.data.message);
+      setNote("");
+    } else if (fetcher.data.message) {
+      toast.error(fetcher.data.message);
+    }
+  }, [fetcher.state, fetcher.data]);
+
+  return (
+    <fetcher.Form method="post" className="space-y-3">
+      <input type="hidden" name="intent" value="approve" />
+      <div className="space-y-2">
+        <Label htmlFor="approve-note">Note (optional)</Label>
+        <Textarea
+          id="approve-note"
+          name="note"
+          value={note}
+          onChange={(event) => setNote(event.target.value)}
+          placeholder="For the audit trail. The buyer does not see this."
+          aria-invalid={noteError ? true : undefined}
+          rows={2}
+        />
+        {noteError && <p className="text-sm text-destructive">{noteError}</p>}
+      </div>
+      <Button type="submit" disabled={fetcher.state !== "idle"}>
+        {fetcher.state !== "idle" ? "Approving…" : "Approve and refund"}
+      </Button>
+    </fetcher.Form>
+  );
+}
+
+const MONEY_STATUS_LABELS: Record<RefundMoneyStatus, string> = {
+  [RefundMoneyStatus.Pending]: "Pending",
+  [RefundMoneyStatus.Issued]: "Issued",
+  [RefundMoneyStatus.Failed]: "Failed",
+};
 
 function AuditTrail({ entries }: { entries: RefundRequestAuditEntry[] }) {
   if (entries.length === 0) {
@@ -290,8 +360,29 @@ export default function AdminRefundRequest({
             <CardHeader>
               <CardTitle>Decision</CardTitle>
             </CardHeader>
+            <CardContent className="space-y-6">
+              <ApproveForm />
+              <div className="border-t pt-6">
+                <DeclineForm />
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {refundRequest.refund && (
+          <Card>
+            <CardHeader>
+              <CardTitle>Refund</CardTitle>
+            </CardHeader>
             <CardContent>
-              <DeclineForm />
+              <dl className="grid gap-4 sm:grid-cols-2">
+                <Field label="Status">
+                  {MONEY_STATUS_LABELS[refundRequest.refund.status]}
+                </Field>
+                <Field label="Amount">
+                  {formatPrice(refundRequest.refund.amount)}
+                </Field>
+              </dl>
             </CardContent>
           </Card>
         )}

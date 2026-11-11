@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, isNotNull, isNull, sql } from "drizzle-orm";
 import { db } from "~/db";
 import { courses, enrollments } from "~/db/schema";
 
@@ -15,13 +15,15 @@ import { courses, enrollments } from "~/db/schema";
 
 export type Enrollment = typeof enrollments.$inferSelect;
 
+type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
 /**
  * The condition an Enrollment must meet to count: to give access, to show on
- * the learner's dashboard and to count in instructor numbers. Every Enrollment
- * counts today.
+ * the learner's dashboard and to count in instructor numbers. A Suspended
+ * Enrollment does not count.
  */
 function activeEnrollmentsWhere() {
-  return sql`1 = 1`;
+  return isNull(enrollments.suspendedAt);
 }
 
 /**
@@ -104,4 +106,52 @@ export function countEnrollmentsForCourse(courseId: number): number {
 /** Enroll a learner in a course. Callers check they aren't enrolled first. */
 export function enroll(userId: number, courseId: number): Enrollment {
   return db.insert(enrollments).values({ userId, courseId }).returning().get();
+}
+
+/**
+ * The learner's Suspended Enrollment in a course, if they have one: the
+ * purchase behind it was refunded, and their progress is waiting for them.
+ */
+export function findSuspendedEnrollment(
+  userId: number,
+  courseId: number
+): Enrollment | undefined {
+  return db
+    .select()
+    .from(enrollments)
+    .where(
+      and(
+        eq(enrollments.userId, userId),
+        eq(enrollments.courseId, courseId),
+        isNotNull(enrollments.suspendedAt)
+      )
+    )
+    .get();
+}
+
+/**
+ * Suspends a learner's Enrollment in a course, because the purchase behind it
+ * was refunded. Nothing is deleted — progress stays (ADR 0001). Pass the
+ * transaction when suspending is part of a larger change, so it commits or
+ * rolls back with it. Returns whether an Enrollment was suspended.
+ */
+export function suspendEnrollment(
+  userId: number,
+  courseId: number,
+  now: Date = new Date(),
+  tx: Transaction | typeof db = db
+): boolean {
+  const result = tx
+    .update(enrollments)
+    .set({ suspendedAt: now.toISOString() })
+    .where(
+      and(
+        eq(enrollments.userId, userId),
+        eq(enrollments.courseId, courseId),
+        activeEnrollmentsWhere()
+      )
+    )
+    .run();
+
+  return result.changes > 0;
 }

@@ -3,7 +3,9 @@ import { z } from "zod";
 import { and, asc, count, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import { db } from "~/db";
 import { formatPrice } from "~/lib/utils";
+import { suspendEnrollment } from "~/lib/enrollments.server";
 import {
+  coupons,
   courses,
   lessonProgress,
   LessonProgressStatus,
@@ -12,6 +14,7 @@ import {
   purchases,
   refundRequestEvents,
   RefundRequestEventType,
+  RefundMoneyStatus,
   refunds,
   RefundStatus,
   users,
@@ -182,6 +185,8 @@ export function getRefundRequestDetail(id: number, now: Date = new Date()) {
       reason: refunds.reason,
       requestedAt: refunds.requestedAt,
       resolvedAt: refunds.resolvedAt,
+      amountRefunded: refunds.amountRefunded,
+      moneyStatus: refunds.moneyStatus,
       purchasedAt: purchases.createdAt,
       amountPaid: purchases.amountPaid,
       buyerId: users.id,
@@ -207,6 +212,11 @@ export function getRefundRequestDetail(id: number, now: Date = new Date()) {
     reason: row.reason,
     requestedAt: row.requestedAt,
     resolvedAt: row.resolvedAt,
+    // The Refund, once the request is approved; null while Open or Declined.
+    refund:
+      row.moneyStatus != null && row.amountRefunded != null
+        ? { status: row.moneyStatus, amount: row.amountRefunded }
+        : null,
     purchasedAt: row.purchasedAt,
     amountPaid: row.amountPaid,
     buyer: { id: row.buyerId, name: row.buyerName, email: row.buyerEmail },
@@ -483,4 +493,157 @@ export function declineRefundRequest(
   console.log(`[email] to=${email.to} subject=${email.subject}\n${email.body}`);
 
   return { outcome: "declined", email };
+}
+
+const approveSchema = z.object({
+  note: z
+    .string({ invalid_type_error: "The note must be text." })
+    .trim()
+    .max(1000, "Please keep the note under 1000 characters.")
+    .nullish()
+    .transform((note) => (note ? note : null)),
+});
+
+/**
+ * The email the buyer gets when their Refund Request is approved. There is no
+ * mail transport wired up yet, so the built message goes to the server log.
+ */
+function buildRefundRequestApprovedEmail(input: {
+  buyerName: string;
+  buyerEmail: string;
+  courseTitle: string;
+  amountRefunded: number;
+}) {
+  return {
+    to: input.buyerEmail,
+    subject: `Refund approved — ${input.courseTitle}`,
+    body: [
+      `Hi ${input.buyerName},`,
+      "",
+      `Your refund request for "${input.courseTitle}" has been approved. Your money is on its way: ${formatPrice(input.amountRefunded)} is being sent back to you.`,
+      "",
+      "Your progress in the course is saved, and will be back if you buy it again.",
+      "",
+      "— The Cadence team",
+    ].join("\n"),
+  };
+}
+
+export type ApproveRefundRequestResult =
+  | {
+      outcome: "approved";
+      email: { to: string; subject: string; body: string };
+    }
+  | { outcome: "invalid"; errors: Record<string, string> }
+  | { outcome: "already-decided"; alreadyDecided: AlreadyDecided };
+
+/**
+ * An admin approves an Open Refund Request, with an optional note for the
+ * audit trail. In one transaction it creates a Pending Refund for the full
+ * amount paid and suspends the buyer's Enrollment in the course (ADR 0001:
+ * suspended, never deleted — progress is kept). Nothing about the 14-day
+ * window or watch time is checked: those inform the decision, not gate it.
+ * The buyer is emailed only when this call is the one that approved it.
+ * Throws 404 when there is no such Refund Request.
+ */
+export function approveRefundRequest(
+  refundRequestId: number,
+  actorUserId: number,
+  input: { note?: unknown },
+  now: Date = new Date()
+): ApproveRefundRequestResult {
+  const parsed = approveSchema.safeParse(input);
+
+  if (!parsed.success) {
+    const errors: Record<string, string> = {};
+    for (const [key, messages] of Object.entries(
+      parsed.error.flatten().fieldErrors
+    )) {
+      if (messages && messages.length > 0) errors[key] = messages[0];
+    }
+    return { outcome: "invalid", errors };
+  }
+
+  const request = db
+    .select({
+      purchaseId: purchases.id,
+      amountPaid: purchases.amountPaid,
+      buyerId: users.id,
+      buyerName: users.name,
+      buyerEmail: users.email,
+      courseId: courses.id,
+      courseTitle: courses.title,
+    })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .innerJoin(users, eq(purchases.userId, users.id))
+    .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .where(eq(refunds.id, refundRequestId))
+    .get();
+
+  if (!request) {
+    throw data("Refund Request not found", { status: 404 });
+  }
+
+  const { note } = parsed.data;
+  const result = db.transaction((tx) => {
+    const decision = decideIfStillOpen(
+      tx,
+      refundRequestId,
+      RefundStatus.Approved,
+      actorUserId,
+      note,
+      now
+    );
+    if (!decision.decided) return decision;
+
+    // A Refund is always the full amount paid.
+    tx.update(refunds)
+      .set({
+        moneyStatus: RefundMoneyStatus.Pending,
+        amountRefunded: request.amountPaid,
+      })
+      .where(eq(refunds.id, refundRequestId))
+      .run();
+
+    if (isTeamPurchase(tx, request.purchaseId)) {
+      // A team purchase paid for Team Seats, not the buyer's own Enrollment,
+      // so no Enrollment is suspended. Voiding its unclaimed Team Seats is
+      // issue #13 and belongs here.
+    } else {
+      suspendEnrollment(request.buyerId, request.courseId, now, tx);
+    }
+
+    return decision;
+  });
+
+  if (!result.decided) {
+    return {
+      outcome: "already-decided",
+      alreadyDecided: result.alreadyDecided,
+    };
+  }
+
+  const email = buildRefundRequestApprovedEmail({
+    buyerName: request.buyerName,
+    buyerEmail: request.buyerEmail,
+    courseTitle: request.courseTitle,
+    amountRefunded: request.amountPaid,
+  });
+
+  console.log(`[email] to=${email.to} subject=${email.subject}\n${email.body}`);
+
+  return { outcome: "approved", email };
+}
+
+/** A team purchase is one that bought Team Seats (each seat has a coupon). */
+function isTeamPurchase(tx: Transaction, purchaseId: number): boolean {
+  const seat = tx
+    .select({ id: coupons.id })
+    .from(coupons)
+    .where(eq(coupons.purchaseId, purchaseId))
+    .limit(1)
+    .get();
+
+  return seat !== undefined;
 }

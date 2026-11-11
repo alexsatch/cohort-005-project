@@ -5,7 +5,7 @@ import { z } from "zod";
 import type { Route } from "./+types/courses.$slug";
 import { getCurrentUserId } from "~/lib/session";
 import { db } from "~/db";
-import { isEnrolled } from "~/lib/enrollments.server";
+import { findSuspendedEnrollment, isEnrolled } from "~/lib/enrollments.server";
 import {
   courses,
   categories,
@@ -503,6 +503,7 @@ export async function loader({ params, request }: Route.LoaderArgs) {
   const currentUserId = await getCurrentUserId(request);
 
   let enrolled = false;
+  let suspended = false;
   let progress = 0;
   let lessonProgressMap: Record<number, string> = {};
   let nextLessonId: number | null = null;
@@ -510,6 +511,10 @@ export async function loader({ params, request }: Route.LoaderArgs) {
 
   if (currentUserId) {
     enrolled = isEnrolled(currentUserId, course.id);
+    // Refunded: no longer enrolled, but their progress is waiting for them.
+    suspended =
+      !enrolled &&
+      findSuspendedEnrollment(currentUserId, course.id) !== undefined;
 
     if (enrolled) {
       refundOffer = getRefundOffer(currentUserId, { id: course.id });
@@ -548,6 +553,7 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     salesCopyHtml,
     lessonCount,
     enrolled,
+    suspended,
     progress,
     lessonProgressMap,
     nextLessonId,
@@ -649,6 +655,7 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
     salesCopyHtml,
     lessonCount,
     enrolled,
+    suspended,
     progress,
     lessonProgressMap,
     nextLessonId,
@@ -901,7 +908,14 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
                   )}
                 </>
               ) : (
-                enrollButton
+                <>
+                  {enrollButton}
+                  {suspended && (
+                    <p className="text-sm text-muted-foreground">
+                      Your progress is saved and will be back if you buy again.
+                    </p>
+                  )}
+                </>
               )}
               <div className="space-y-2 pt-2 text-sm text-muted-foreground">
                 <div className="flex items-center gap-2">

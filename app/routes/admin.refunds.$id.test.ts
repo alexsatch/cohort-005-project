@@ -6,6 +6,7 @@ import {
   courses,
   CourseStatus,
   purchases,
+  RefundMoneyStatus,
   refunds,
   RefundStatus,
   users,
@@ -16,10 +17,13 @@ import {
   getRefundRequestDetail,
   listRefundRequests,
 } from "~/lib/refund-requests.server";
+import { getAccess } from "~/lib/access.server";
+import { enroll } from "~/lib/enrollments.server";
 import { setCurrentUserId } from "~/lib/session";
 import { useTestDatabase } from "~/test/db";
 import { action as refundRequestAction } from "./admin.refunds.$id";
 import { action as requestRefundAction } from "./courses.$slug.refund";
+import { loader as courseLoader } from "./courses.$slug";
 
 useTestDatabase();
 
@@ -105,6 +109,129 @@ function decline(userId: number, id: number, reason: string) {
     })
   );
 }
+
+function approve(userId: number, id: number, note = "") {
+  const url = `http://localhost/admin/refunds/${id}`;
+  return postAs(userId, url, { intent: "approve", note }).then((request) =>
+    refundRequestAction({
+      request,
+      params: { id: String(id) },
+      context: new RouterContextProvider(),
+      url: new URL(url),
+      pattern: "/admin/refunds/:id",
+    })
+  );
+}
+
+async function getAs(userId: number, url: string) {
+  const setCookie = await setCurrentUserId(new Request(url), userId);
+  return new Request(url, {
+    // A fixed country, so resolving it never goes to the network.
+    headers: { Cookie: setCookie.split(";")[0], "CF-IPCountry": "US" },
+  });
+}
+
+describe("approving from the admin detail page", () => {
+  it("approves an Open Refund Request for an admin, with a Pending Refund", async () => {
+    const { ada, liam, course, request } = seedOpenRefundRequest();
+    enroll(liam.id, course.id);
+
+    const result = await approve(ada.id, request.id, "Fine by me.");
+
+    expect(result).toMatchObject({ ok: true });
+    expect(getRefundRequestDetail(request.id)).toMatchObject({
+      status: RefundStatus.Approved,
+      refund: { status: RefundMoneyStatus.Pending, amount: 7900 },
+    });
+    expect(getRefundRequestAuditTrail(request.id)).toMatchObject([
+      { note: "Fine by me.", actor: { id: ada.id } },
+    ]);
+  });
+
+  it("rejects approving an already-decided request with 409 and changes nothing", async () => {
+    const { ada, request } = seedOpenRefundRequest();
+    const bob = createUser("Bob", UserRole.Admin);
+    await decline(bob.id, request.id, "No.");
+    const log = vi.mocked(console.log);
+    log.mockClear();
+
+    const result = await approve(ada.id, request.id);
+
+    expect(result).toMatchObject({
+      init: { status: 409 },
+      data: { message: "Already declined by Bob." },
+    });
+    expect(getRefundRequestDetail(request.id)).toMatchObject({
+      status: RefundStatus.Declined,
+      refund: null,
+    });
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["the buyer", "liam"],
+    ["the course's owning instructor", "instructor"],
+  ] as const)("rejects %s with 403", async (_label, who) => {
+    const seeded = seedOpenRefundRequest();
+    const userId = who === "liam" ? seeded.liam.id : seeded.instructor.id;
+
+    await expect(approve(userId, seeded.request.id)).rejects.toMatchObject({
+      init: { status: 403 },
+    });
+    expect(getRefundRequestDetail(seeded.request.id)?.status).toBe(
+      RefundStatus.Open
+    );
+  });
+});
+
+describe("after an approval", () => {
+  it("the learner can no longer view the course content", async () => {
+    const { ada, liam, course, request } = seedOpenRefundRequest();
+    enroll(liam.id, course.id);
+    const url = `http://localhost/courses/${course.slug}`;
+    expect(
+      (await getAccess(await getAs(liam.id, url), course.id)).canViewContent
+    ).toBe(true);
+
+    await approve(ada.id, request.id);
+
+    const access = await getAccess(await getAs(liam.id, url), course.id);
+    expect(access).toMatchObject({ enrolled: false, canViewContent: false });
+  });
+
+  it("the course page offers the buy button again and says their progress is saved", async () => {
+    const { ada, liam, course, request } = seedOpenRefundRequest();
+    enroll(liam.id, course.id);
+    await approve(ada.id, request.id);
+
+    const url = `http://localhost/courses/${course.slug}`;
+    const page = await courseLoader({
+      request: await getAs(liam.id, url),
+      params: { slug: course.slug },
+      context: new RouterContextProvider(),
+      url: new URL(url),
+      pattern: "/courses/:slug",
+    });
+
+    expect(page).toMatchObject({ enrolled: false, suspended: true });
+  });
+
+  it("a learner who was never enrolled is not told their progress is saved", async () => {
+    const { course } = seedOpenRefundRequest();
+    const newcomer = createUser("Nina", UserRole.Student);
+
+    const url = `http://localhost/courses/${course.slug}`;
+    const page = await courseLoader({
+      request: await getAs(newcomer.id, url),
+      params: { slug: course.slug },
+      context: new RouterContextProvider(),
+      url: new URL(url),
+      pattern: "/courses/:slug",
+    });
+
+    expect(page).toMatchObject({ enrolled: false, suspended: false });
+  });
+});
 
 describe("declining from the admin detail page", () => {
   it("declines an Open Refund Request for an admin", async () => {
