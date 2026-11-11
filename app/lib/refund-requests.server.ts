@@ -2,6 +2,7 @@ import { data } from "react-router";
 import { z } from "zod";
 import { and, asc, count, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import { db } from "~/db";
+import { formatPrice } from "~/lib/utils";
 import {
   courses,
   lessonProgress,
@@ -9,6 +10,8 @@ import {
   lessons,
   modules,
   purchases,
+  refundRequestEvents,
+  RefundRequestEventType,
   refunds,
   RefundStatus,
   users,
@@ -18,7 +21,7 @@ import {
 // ─── Refund Requests ───
 // Each row of the `refunds` table is a Refund Request (see GLOSSARY.md): a
 // buyer's ask to get back what they paid for one purchase. This module is the
-// admin side of them: listing, reading the details, and (later) deciding them.
+// admin side of them: listing, reading the details, and deciding them.
 
 const refundRequestFilterSchema = z.object({
   status: z.nativeEnum(RefundStatus).default(RefundStatus.Open),
@@ -215,9 +218,269 @@ export function getRefundRequestDetail(id: number, now: Date = new Date()) {
     },
     daysSincePurchase: wholeDaysBetween(row.purchasedAt, now),
     otherRefundRequests: getOtherRefundRequests(row.buyerId, row.id),
+    auditTrail: getRefundRequestAuditTrail(row.id),
   };
 }
 
 export type RefundRequestDetail = NonNullable<
   ReturnType<typeof getRefundRequestDetail>
 >;
+
+// ─── Audit trail ───
+
+/** Every step taken on a Refund Request, oldest first. */
+export function getRefundRequestAuditTrail(refundRequestId: number) {
+  return db
+    .select({
+      id: refundRequestEvents.id,
+      type: refundRequestEvents.type,
+      note: refundRequestEvents.note,
+      createdAt: refundRequestEvents.createdAt,
+      actorId: users.id,
+      actorName: users.name,
+    })
+    .from(refundRequestEvents)
+    .innerJoin(users, eq(refundRequestEvents.actorUserId, users.id))
+    .where(eq(refundRequestEvents.refundRequestId, refundRequestId))
+    .orderBy(asc(refundRequestEvents.createdAt), asc(refundRequestEvents.id))
+    .all()
+    .map((row) => ({
+      id: row.id,
+      type: row.type,
+      note: row.note,
+      createdAt: row.createdAt,
+      actor: { id: row.actorId, name: row.actorName },
+    }));
+}
+
+export type RefundRequestAuditEntry = ReturnType<
+  typeof getRefundRequestAuditTrail
+>[number];
+
+type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/** Appends one step to a Refund Request's audit trail. */
+function recordRefundRequestEvent(
+  tx: Transaction,
+  refundRequestId: number,
+  type: RefundRequestEventType,
+  actorUserId: number,
+  note: string | null,
+  now: Date
+) {
+  tx.insert(refundRequestEvents)
+    .values({
+      refundRequestId,
+      type,
+      actorUserId,
+      note,
+      createdAt: now.toISOString(),
+    })
+    .run();
+}
+
+// ─── Deciding ───
+
+type Decision = RefundStatus.Approved | RefundStatus.Declined;
+
+const DECISION_EVENT: Record<Decision, RefundRequestEventType> = {
+  [RefundStatus.Approved]: RefundRequestEventType.Approved,
+  [RefundStatus.Declined]: RefundRequestEventType.Declined,
+};
+
+export type AlreadyDecided = {
+  status: RefundStatus;
+  decidedBy: { id: number; name: string } | null;
+  message: string;
+};
+
+function describeAlreadyDecided(refundRequestId: number): AlreadyDecided {
+  const row = db
+    .select({
+      status: refunds.status,
+      deciderId: users.id,
+      deciderName: users.name,
+    })
+    .from(refunds)
+    .leftJoin(users, eq(refunds.resolvedByUserId, users.id))
+    .where(eq(refunds.id, refundRequestId))
+    .get();
+
+  const status = row?.status ?? RefundStatus.Open;
+  const decidedBy =
+    row?.deciderId != null && row.deciderName != null
+      ? { id: row.deciderId, name: row.deciderName }
+      : null;
+
+  return {
+    status,
+    decidedBy,
+    message: decidedBy
+      ? `Already ${status} by ${decidedBy.name}.`
+      : `Already ${status}.`,
+  };
+}
+
+/**
+ * First decision wins. Moves a Refund Request from Open to the decision and
+ * records the step in its audit trail — but only if it is still Open. The
+ * status change is a conditional update, so of two admins deciding at once
+ * exactly one succeeds; the other gets back who decided it and how, and
+ * nothing is written for them.
+ *
+ * Call inside `db.transaction`, so whatever else the decision does (a Refund,
+ * suspending an Enrollment) commits or rolls back with it.
+ */
+function decideIfStillOpen(
+  tx: Transaction,
+  refundRequestId: number,
+  decision: Decision,
+  actorUserId: number,
+  note: string | null,
+  now: Date
+): { decided: true } | { decided: false; alreadyDecided: AlreadyDecided } {
+  const result = tx
+    .update(refunds)
+    .set({
+      status: decision,
+      resolvedAt: now.toISOString(),
+      resolvedByUserId: actorUserId,
+    })
+    .where(
+      and(eq(refunds.id, refundRequestId), eq(refunds.status, RefundStatus.Open))
+    )
+    .run();
+
+  if (result.changes === 0) {
+    return {
+      decided: false,
+      alreadyDecided: describeAlreadyDecided(refundRequestId),
+    };
+  }
+
+  recordRefundRequestEvent(
+    tx,
+    refundRequestId,
+    DECISION_EVENT[decision],
+    actorUserId,
+    note,
+    now
+  );
+
+  return { decided: true };
+}
+
+const declineSchema = z.object({
+  reason: z
+    .string({
+      required_error: "Tell the buyer why their request is declined.",
+      invalid_type_error: "Tell the buyer why their request is declined.",
+    })
+    .trim()
+    .min(1, "Tell the buyer why their request is declined.")
+    .max(1000, "Please keep the reason under 1000 characters."),
+});
+
+/**
+ * The email the buyer gets when their Refund Request is declined. There is no
+ * mail transport wired up yet, so the built message goes to the server log.
+ */
+function buildRefundRequestDeclinedEmail(input: {
+  buyerName: string;
+  buyerEmail: string;
+  courseTitle: string;
+  amountPaid: number;
+  reason: string;
+}) {
+  return {
+    to: input.buyerEmail,
+    subject: `Refund request declined — ${input.courseTitle}`,
+    body: [
+      `Hi ${input.buyerName},`,
+      "",
+      `We have reviewed your refund request for "${input.courseTitle}" (${formatPrice(input.amountPaid)}), and we are not able to approve it.`,
+      "",
+      "Our reason:",
+      input.reason,
+      "",
+      "If something has changed, you are welcome to raise a new refund request from the course page.",
+      "",
+      "— The Cadence team",
+    ].join("\n"),
+  };
+}
+
+export type DeclineRefundRequestResult =
+  | { outcome: "declined"; email: { to: string; subject: string; body: string } }
+  | { outcome: "invalid"; errors: Record<string, string> }
+  | { outcome: "already-decided"; alreadyDecided: AlreadyDecided };
+
+/**
+ * An admin declines an Open Refund Request with a reason, which is required.
+ * The reason is the note on the `declined` step of the audit trail, and the
+ * buyer is emailed it. Throws 404 when there is no such Refund Request.
+ */
+export function declineRefundRequest(
+  refundRequestId: number,
+  actorUserId: number,
+  input: { reason: unknown },
+  now: Date = new Date()
+): DeclineRefundRequestResult {
+  const parsed = declineSchema.safeParse(input);
+
+  if (!parsed.success) {
+    const errors: Record<string, string> = {};
+    for (const [key, messages] of Object.entries(
+      parsed.error.flatten().fieldErrors
+    )) {
+      if (messages && messages.length > 0) errors[key] = messages[0];
+    }
+    return { outcome: "invalid", errors };
+  }
+
+  const request = db
+    .select({
+      amountPaid: purchases.amountPaid,
+      buyerName: users.name,
+      buyerEmail: users.email,
+      courseTitle: courses.title,
+    })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .innerJoin(users, eq(purchases.userId, users.id))
+    .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .where(eq(refunds.id, refundRequestId))
+    .get();
+
+  if (!request) {
+    throw data("Refund Request not found", { status: 404 });
+  }
+
+  const { reason } = parsed.data;
+  const result = db.transaction((tx) =>
+    decideIfStillOpen(
+      tx,
+      refundRequestId,
+      RefundStatus.Declined,
+      actorUserId,
+      reason,
+      now
+    )
+  );
+
+  if (!result.decided) {
+    return { outcome: "already-decided", alreadyDecided: result.alreadyDecided };
+  }
+
+  const email = buildRefundRequestDeclinedEmail({
+    buyerName: request.buyerName,
+    buyerEmail: request.buyerEmail,
+    courseTitle: request.courseTitle,
+    amountPaid: request.amountPaid,
+    reason,
+  });
+
+  console.log(`[email] to=${email.to} subject=${email.subject}\n${email.body}`);
+
+  return { outcome: "declined", email };
+}

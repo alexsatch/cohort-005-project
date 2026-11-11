@@ -1,11 +1,21 @@
-import { data, Link } from "react-router";
+import { useEffect, useState } from "react";
+import { data, Link, useFetcher } from "react-router";
+import { toast } from "sonner";
 import { z } from "zod";
 import type { Route } from "./+types/admin.refunds.$id";
+import { RefundRequestEventType, RefundStatus } from "~/db/schema";
 import { requireAdmin } from "~/lib/access.server";
-import { getRefundRequestDetail } from "~/lib/refund-requests.server";
-import { parseParams } from "~/lib/validation";
+import {
+  declineRefundRequest,
+  getRefundRequestDetail,
+  type RefundRequestAuditEntry,
+} from "~/lib/refund-requests.server";
+import { parseFormData, parseParams } from "~/lib/validation";
 import { formatPrice } from "~/lib/utils";
+import { Button } from "~/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "~/components/ui/card";
+import { Label } from "~/components/ui/label";
+import { Textarea } from "~/components/ui/textarea";
 import { RefundRequestStatusBadge } from "~/components/refund-request-status-badge";
 import { AdminErrorScreen } from "~/components/admin-error-screen";
 
@@ -29,6 +39,50 @@ export async function loader({ params, request }: Route.LoaderArgs) {
   return { refundRequest };
 }
 
+const refundRequestIntentSchema = z.object({
+  intent: z.literal("decline"),
+});
+
+export async function action({ params, request }: Route.ActionArgs) {
+  // Loader guards don't protect actions.
+  const { userId } = await requireAdmin(request);
+  const { id } = parseParams(params, refundRequestParamsSchema);
+
+  const formData = await request.formData();
+  const intent = parseFormData(formData, refundRequestIntentSchema);
+
+  if (!intent.success) {
+    throw data("Invalid action.", { status: 400 });
+  }
+
+  const result = declineRefundRequest(id, userId, {
+    reason: formData.get("reason"),
+  });
+
+  switch (result.outcome) {
+    case "invalid":
+      return data(
+        { ok: false as const, errors: result.errors, message: null },
+        { status: 400 }
+      );
+    case "already-decided":
+      return data(
+        {
+          ok: false as const,
+          errors: null,
+          message: result.alreadyDecided.message,
+        },
+        { status: 409 }
+      );
+    case "declined":
+      return {
+        ok: true as const,
+        errors: null,
+        message: "Refund Request declined. The buyer has been emailed.",
+      };
+  }
+}
+
 function formatDate(iso: string) {
   return new Date(iso).toLocaleDateString("en-US", {
     year: "numeric",
@@ -42,6 +96,101 @@ function formatWatchTime(totalSeconds: number) {
   const hours = Math.floor(minutes / 60);
   if (hours === 0) return `${minutes}m`;
   return `${hours}h ${minutes % 60}m`;
+}
+
+function formatDateTime(iso: string) {
+  return new Date(iso).toLocaleString("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+const EVENT_LABELS: Record<RefundRequestEventType, string> = {
+  [RefundRequestEventType.Declined]: "Declined",
+  [RefundRequestEventType.Approved]: "Approved",
+  [RefundRequestEventType.RefundIssued]: "Refund issued",
+  [RefundRequestEventType.RefundFailed]: "Refund failed",
+  [RefundRequestEventType.RefundRetried]: "Refund retried",
+};
+
+function DeclineForm() {
+  const fetcher = useFetcher<typeof action>();
+  const [reason, setReason] = useState("");
+  const reasonError =
+    fetcher.state === "idle" ? fetcher.data?.errors?.reason : undefined;
+
+  useEffect(() => {
+    if (fetcher.state !== "idle" || !fetcher.data) return;
+    if (fetcher.data.ok) {
+      toast.success(fetcher.data.message);
+      setReason("");
+    } else if (fetcher.data.message) {
+      toast.error(fetcher.data.message);
+    }
+  }, [fetcher.state, fetcher.data]);
+
+  return (
+    <fetcher.Form method="post" className="space-y-3">
+      <input type="hidden" name="intent" value="decline" />
+      <div className="space-y-2">
+        <Label htmlFor="decline-reason">Reason for declining</Label>
+        <Textarea
+          id="decline-reason"
+          name="reason"
+          value={reason}
+          onChange={(event) => setReason(event.target.value)}
+          placeholder="The buyer will see this in their email."
+          aria-invalid={reasonError ? true : undefined}
+          rows={3}
+        />
+        {reasonError && (
+          <p className="text-sm text-destructive">{reasonError}</p>
+        )}
+      </div>
+      <Button
+        type="submit"
+        variant="destructive"
+        disabled={fetcher.state !== "idle"}
+      >
+        {fetcher.state !== "idle" ? "Declining…" : "Decline"}
+      </Button>
+    </fetcher.Form>
+  );
+}
+
+function AuditTrail({ entries }: { entries: RefundRequestAuditEntry[] }) {
+  if (entries.length === 0) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        No decision has been made yet.
+      </p>
+    );
+  }
+
+  return (
+    <ol className="divide-y divide-border">
+      {entries.map((entry) => (
+        <li key={entry.id} className="py-3">
+          <div className="flex items-center justify-between gap-4">
+            <span className="text-sm font-medium">
+              {EVENT_LABELS[entry.type]} by {entry.actor.name}
+            </span>
+            <span className="text-xs text-muted-foreground">
+              {formatDateTime(entry.createdAt)}
+            </span>
+          </div>
+          {entry.note && (
+            <p className="mt-2 whitespace-pre-wrap rounded-md bg-muted/50 p-3 text-sm">
+              {entry.note}
+            </p>
+          )}
+        </li>
+      ))}
+    </ol>
+  );
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
@@ -133,6 +282,26 @@ export default function AdminRefundRequest({
                 {refundRequest.daysSincePurchase}
               </Field>
             </dl>
+          </CardContent>
+        </Card>
+
+        {refundRequest.status === RefundStatus.Open && (
+          <Card>
+            <CardHeader>
+              <CardTitle>Decision</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <DeclineForm />
+            </CardContent>
+          </Card>
+        )}
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Audit trail</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <AuditTrail entries={refundRequest.auditTrail} />
           </CardContent>
         </Card>
 

@@ -37,6 +37,15 @@ export enum RefundStatus {
   Declined = "declined",
 }
 
+// Every step taken on a Refund Request, as recorded in its audit trail.
+export enum RefundRequestEventType {
+  Declined = "declined",
+  Approved = "approved",
+  RefundIssued = "refund_issued",
+  RefundFailed = "refund_failed",
+  RefundRetried = "refund_retried",
+}
+
 export enum TeamMemberRole {
   Admin = "admin",
   Member = "member",
@@ -251,6 +260,31 @@ export const refunds = sqliteTable(
     resolvedByUserId: integer("resolved_by_user_id").references(() => users.id),
   },
   (table) => [index("refunds_purchase_idx").on(table.purchaseId)]
+);
+
+// The audit trail of a Refund Request: one row per step, who took it, when,
+// and an optional note. A decline's note is its reason, which is required.
+export const refundRequestEvents = sqliteTable(
+  "refund_request_events",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    refundRequestId: integer("refund_request_id")
+      .notNull()
+      .references(() => refunds.id),
+    type: text("type").notNull().$type<RefundRequestEventType>(),
+    actorUserId: integer("actor_user_id")
+      .notNull()
+      .references(() => users.id),
+    note: text("note"),
+    createdAt: text("created_at")
+      .notNull()
+      .$defaultFn(() => new Date().toISOString()),
+  },
+  (table) => [
+    index("refund_request_events_refund_request_idx").on(
+      table.refundRequestId
+    ),
+  ]
 );
 
 export const teams = sqliteTable("teams", {

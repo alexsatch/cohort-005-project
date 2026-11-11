@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { db } from "~/db";
 import {
@@ -11,6 +11,7 @@ import {
   modules,
   purchases,
   refunds,
+  RefundRequestEventType,
   RefundStatus,
   users,
   UserRole,
@@ -19,6 +20,8 @@ import {
 import { useTestDatabase } from "~/test/db";
 import {
   countOpenRefundRequests,
+  declineRefundRequest,
+  getRefundRequestAuditTrail,
   getRefundRequestDetail,
   listRefundRequests,
   parseRefundRequestFilter,
@@ -382,5 +385,177 @@ describe("getRefundRequestDetail", () => {
         },
       ]
     );
+  });
+});
+
+describe("declineRefundRequest", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const decidedAt = new Date("2026-01-05T09:30:00.000Z");
+
+  function setUp() {
+    const { liam, course } = seedBasics();
+    const ada = createUser("Ada", UserRole.Admin);
+    const request = createRefundRequest(
+      createPurchase(liam.id, course.id, 7900).id
+    );
+    return { liam, course, ada, request };
+  }
+
+  function silenceEmailLog() {
+    return vi.spyOn(console, "log").mockImplementation(() => {});
+  }
+
+  it("declines an Open Refund Request and records who declined it, when, and why", () => {
+    silenceEmailLog();
+    const { ada, request } = setUp();
+
+    const result = declineRefundRequest(
+      request.id,
+      ada.id,
+      { reason: "  You have watched most of the course.  " },
+      decidedAt
+    );
+
+    expect(result.outcome).toBe("declined");
+    expect(getRefundRequestDetail(request.id)).toMatchObject({
+      status: RefundStatus.Declined,
+      resolvedAt: "2026-01-05T09:30:00.000Z",
+    });
+    expect(getRefundRequestAuditTrail(request.id)).toEqual([
+      {
+        id: expect.any(Number),
+        type: RefundRequestEventType.Declined,
+        note: "You have watched most of the course.",
+        createdAt: "2026-01-05T09:30:00.000Z",
+        actor: { id: ada.id, name: "Ada" },
+      },
+    ]);
+  });
+
+  it("shows the audit trail on the detail", () => {
+    silenceEmailLog();
+    const { ada, request } = setUp();
+    declineRefundRequest(request.id, ada.id, { reason: "Too late." }, decidedAt);
+
+    expect(getRefundRequestDetail(request.id)?.auditTrail).toMatchObject([
+      { type: RefundRequestEventType.Declined, note: "Too late." },
+    ]);
+  });
+
+  it("emails the buyer the course and the reason", () => {
+    const log = silenceEmailLog();
+    const { ada, request } = setUp();
+
+    const result = declineRefundRequest(
+      request.id,
+      ada.id,
+      { reason: "You have watched most of the course." },
+      decidedAt
+    );
+
+    if (result.outcome !== "declined") throw new Error(result.outcome);
+    expect(result.email.to).toBe("liam@example.com");
+    expect(result.email.subject).toContain("Introduction to TypeScript");
+    expect(result.email.body).toContain("You have watched most of the course.");
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining("You have watched most of the course.")
+    );
+  });
+
+  it.each([[""], ["   "], [null]])(
+    "rejects a missing reason (%j) with a field error and changes nothing",
+    (reason) => {
+      const log = silenceEmailLog();
+      const { ada, request } = setUp();
+
+      const result = declineRefundRequest(
+        request.id,
+        ada.id,
+        { reason },
+        decidedAt
+      );
+
+      expect(result).toEqual({
+        outcome: "invalid",
+        errors: { reason: expect.any(String) },
+      });
+      expect(getRefundRequestDetail(request.id)).toMatchObject({
+        status: RefundStatus.Open,
+        resolvedAt: null,
+      });
+      expect(getRefundRequestAuditTrail(request.id)).toEqual([]);
+      expect(log).not.toHaveBeenCalled();
+    }
+  );
+
+  it("first decision wins: a second decline is rejected with who decided it and how, and changes nothing", () => {
+    const log = silenceEmailLog();
+    const { ada, request } = setUp();
+    const bob = createUser("Bob", UserRole.Admin);
+    declineRefundRequest(request.id, ada.id, { reason: "First." }, decidedAt);
+    log.mockClear();
+
+    const result = declineRefundRequest(
+      request.id,
+      bob.id,
+      { reason: "Second." },
+      new Date("2026-01-06T09:30:00.000Z")
+    );
+
+    expect(result).toEqual({
+      outcome: "already-decided",
+      alreadyDecided: {
+        status: RefundStatus.Declined,
+        decidedBy: { id: ada.id, name: "Ada" },
+        message: "Already declined by Ada.",
+      },
+    });
+    expect(getRefundRequestDetail(request.id)?.resolvedAt).toBe(
+      "2026-01-05T09:30:00.000Z"
+    );
+    expect(getRefundRequestAuditTrail(request.id)).toMatchObject([
+      { note: "First.", actor: { id: ada.id } },
+    ]);
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it("says how a request was decided when it was approved by someone else", () => {
+    silenceEmailLog();
+    const { ada, request } = setUp();
+    const bob = createUser("Bob", UserRole.Admin);
+    db.update(refunds)
+      .set({
+        status: RefundStatus.Approved,
+        resolvedAt: "2026-01-04T10:00:00.000Z",
+        resolvedByUserId: bob.id,
+      })
+      .where(eq(refunds.id, request.id))
+      .run();
+
+    const result = declineRefundRequest(
+      request.id,
+      ada.id,
+      { reason: "Nope." },
+      decidedAt
+    );
+
+    expect(result).toMatchObject({
+      outcome: "already-decided",
+      alreadyDecided: { message: "Already approved by Bob." },
+    });
+    expect(getRefundRequestDetail(request.id)?.status).toBe(
+      RefundStatus.Approved
+    );
+    expect(getRefundRequestAuditTrail(request.id)).toEqual([]);
+  });
+
+  it("throws a 404 for a Refund Request that does not exist", () => {
+    const ada = createUser("Ada", UserRole.Admin);
+    expect(() =>
+      declineRefundRequest(999, ada.id, { reason: "Why not." }, decidedAt)
+    ).toThrow(expect.objectContaining({ init: { status: 404 } }));
   });
 });
