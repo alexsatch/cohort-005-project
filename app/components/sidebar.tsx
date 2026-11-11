@@ -9,6 +9,7 @@ import {
   LayoutDashboard,
   GraduationCap,
   MessageSquare,
+  Receipt,
   Shield,
   Tag,
   Users,
@@ -40,6 +41,8 @@ interface SidebarProps {
   currentUser: CurrentUser | null;
   recentCourses?: RecentCourse[];
   isTeamAdmin?: boolean;
+  /** Shown as a badge on the Refunds link. Only loaded for admins. */
+  openRefundRequestCount?: number;
 }
 
 interface NavItem {
@@ -47,6 +50,7 @@ interface NavItem {
   to: string;
   icon: React.ReactNode;
   roles: UserRole[] | "all";
+  showsOpenRefundRequestCount?: boolean;
 }
 
 const navItems: NavItem[] = [
@@ -98,6 +102,13 @@ const navItems: NavItem[] = [
     icon: <Tag className="size-4" />,
     roles: [UserRole.Admin],
   },
+  {
+    label: "Refunds",
+    to: "/admin/refunds",
+    icon: <Receipt className="size-4" />,
+    roles: [UserRole.Admin],
+    showsOpenRefundRequestCount: true,
+  },
 ];
 
 function isVisible(item: NavItem, role: UserRole | null): boolean {
@@ -110,6 +121,7 @@ export function Sidebar({
   currentUser,
   recentCourses = [],
   isTeamAdmin = false,
+  openRefundRequestCount = 0,
 }: SidebarProps) {
   const currentUserRole = currentUser?.role ?? null;
   const [isDark, setIsDark] = useState(false);
@@ -153,6 +165,15 @@ export function Sidebar({
             >
               {item.icon}
               {item.label}
+              {item.showsOpenRefundRequestCount &&
+                openRefundRequestCount > 0 && (
+                  <span
+                    className="ml-auto rounded-full bg-primary px-2 py-0.5 text-xs font-semibold text-primary-foreground"
+                    aria-label={`${openRefundRequestCount} Open Refund Requests`}
+                  >
+                    {openRefundRequestCount}
+                  </span>
+                )}
             </NavLink>
           ))}
         {isTeamAdmin && (
