@@ -1,9 +1,8 @@
 import { Link } from "react-router";
 import type { Route } from "./+types/dashboard";
 import { db } from "~/db";
+import { listEnrolledCoursesForUser } from "~/lib/enrollments.server";
 import {
-  enrollments,
-  courses,
   modules,
   lessons,
   lessonProgress,
@@ -17,24 +16,6 @@ import { Skeleton } from "~/components/ui/skeleton";
 import { AlertTriangle, BookOpen, CheckCircle2, GraduationCap, PlayCircle } from "lucide-react";
 import { CourseImage } from "~/components/course-image";
 import { data, isRouteErrorResponse } from "react-router";
-
-function getUserEnrolledCourses(userId: number) {
-  return db
-    .select({
-      enrollmentId: enrollments.id,
-      courseId: enrollments.courseId,
-      enrolledAt: enrollments.enrolledAt,
-      completedAt: enrollments.completedAt,
-      courseTitle: courses.title,
-      courseSlug: courses.slug,
-      courseDescription: courses.description,
-      coverImageUrl: courses.coverImageUrl,
-    })
-    .from(enrollments)
-    .innerJoin(courses, eq(enrollments.courseId, courses.id))
-    .where(eq(enrollments.userId, userId))
-    .all();
-}
 
 function getCourseLessonIds(courseId: number): number[] {
   const courseModules = db
@@ -197,7 +178,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     });
   }
 
-  const enrolledCourses = getUserEnrolledCourses(currentUserId);
+  const enrolledCourses = listEnrolledCoursesForUser(currentUserId);
 
   const coursesWithProgress = enrolledCourses.map((enrollment) => {
     const progress = calculateProgress(currentUserId, enrollment.courseId, false);

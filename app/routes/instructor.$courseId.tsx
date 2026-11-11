@@ -11,13 +11,13 @@ import type { Route } from "./+types/instructor.$courseId";
 import { getCurrentUserId } from "~/lib/session";
 import { CourseStatus, UserRole } from "~/db/schema";
 import { db } from "~/db";
+import { countEnrollmentsForCourse, listEnrollmentsForCourse } from "~/lib/enrollments.server";
 import {
   courses,
   categories,
   users,
   modules,
   lessons,
-  enrollments,
   lessonProgress,
   LessonProgressStatus,
   quizzes,
@@ -356,29 +356,6 @@ function moveLessonToModule(
     .get();
 }
 
-function getEnrollmentCountForCourse(courseId: number) {
-  const result = db
-    .select({ count: sql<number>`count(*)` })
-    .from(enrollments)
-    .where(eq(enrollments.courseId, courseId))
-    .get();
-
-  return result?.count ?? 0;
-}
-
-function getCourseEnrolledStudents(courseId: number) {
-  return db
-    .select({
-      enrollmentId: enrollments.id,
-      userId: enrollments.userId,
-      enrolledAt: enrollments.enrolledAt,
-      completedAt: enrollments.completedAt,
-    })
-    .from(enrollments)
-    .where(eq(enrollments.courseId, courseId))
-    .all();
-}
-
 function getCourseLessonIds(courseId: number): number[] {
   const courseModules = db
     .select({ id: modules.id })
@@ -586,10 +563,10 @@ export async function loader({ params, request }: Route.LoaderArgs) {
   }
 
   const lessonCount = getLessonCountForCourse(courseId);
-  const enrollmentCount = getEnrollmentCountForCourse(courseId);
+  const enrollmentCount = countEnrollmentsForCourse(courseId);
 
   // Student roster data
-  const enrolledStudents = getCourseEnrolledStudents(courseId);
+  const enrolledStudents = listEnrollmentsForCourse(courseId);
 
   // Gather all lessons from the course modules and find which have quizzes
   const allCourseLessons = course.modules.flatMap((mod) => mod.lessons);

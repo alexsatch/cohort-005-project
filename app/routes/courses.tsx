@@ -1,13 +1,13 @@
 import { Form, Link, useSearchParams, useNavigation, isRouteErrorResponse } from "react-router";
 import type { Route } from "./+types/courses";
 import { db } from "~/db";
+import { listEnrolledCoursesForUser } from "~/lib/enrollments.server";
 import {
   courses as coursesTable,
   categories as categoriesTable,
   users,
   modules,
   lessons,
-  enrollments as enrollmentsTable,
   lessonProgress,
   courseRatings,
   CourseStatus,
@@ -110,24 +110,6 @@ function getAllCategories() {
     .select()
     .from(categoriesTable)
     .orderBy(categoriesTable.name)
-    .all();
-}
-
-function getUserEnrolledCourses(userId: number) {
-  return db
-    .select({
-      enrollmentId: enrollmentsTable.id,
-      courseId: enrollmentsTable.courseId,
-      enrolledAt: enrollmentsTable.enrolledAt,
-      completedAt: enrollmentsTable.completedAt,
-      courseTitle: coursesTable.title,
-      courseSlug: coursesTable.slug,
-      courseDescription: coursesTable.description,
-      coverImageUrl: coursesTable.coverImageUrl,
-    })
-    .from(enrollmentsTable)
-    .innerJoin(coursesTable, eq(enrollmentsTable.courseId, coursesTable.id))
-    .where(eq(enrollmentsTable.userId, userId))
     .all();
 }
 
@@ -300,7 +282,7 @@ export async function loader({ request, url }: Route.LoaderArgs) {
     { progress: number; completedLessons: number }
   >();
   if (currentUserId) {
-    const enrollments = getUserEnrolledCourses(currentUserId);
+    const enrollments = listEnrolledCoursesForUser(currentUserId);
     for (const enrollment of enrollments) {
       progressMap.set(enrollment.courseId, {
         progress: calculateProgress(currentUserId, enrollment.courseId, false),

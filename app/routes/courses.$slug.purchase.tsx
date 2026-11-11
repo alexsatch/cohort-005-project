@@ -6,12 +6,17 @@ import type { Route } from "./+types/courses.$slug.purchase";
 import { getCurrentUserId } from "~/lib/session";
 import { db } from "~/db";
 import {
+  countEnrollmentsForCourse,
+  enroll,
+  findEnrollment,
+  isEnrolled,
+} from "~/lib/enrollments.server";
+import {
   courses,
   categories,
   users,
   modules,
   lessons,
-  enrollments,
   purchases,
   teams,
   teamMembers,
@@ -118,30 +123,6 @@ function getLessonCountForCourse(courseId: number) {
   return count?.count ?? 0;
 }
 
-function findEnrollment(userId: number, courseId: number) {
-  return db
-    .select()
-    .from(enrollments)
-    .where(
-      and(eq(enrollments.userId, userId), eq(enrollments.courseId, courseId))
-    )
-    .get();
-}
-
-function isUserEnrolled(userId: number, courseId: number) {
-  return !!findEnrollment(userId, courseId);
-}
-
-function getEnrollmentCountForCourse(courseId: number) {
-  const result = db
-    .select({ count: sql<number>`count(*)` })
-    .from(enrollments)
-    .where(eq(enrollments.courseId, courseId))
-    .get();
-
-  return result?.count ?? 0;
-}
-
 function enrollUser(
   userId: number,
   courseId: number,
@@ -164,11 +145,7 @@ function enrollUser(
     }
   }
 
-  const enrollment = db
-    .insert(enrollments)
-    .values({ userId, courseId })
-    .returning()
-    .get();
+  const enrollment = enroll(userId, courseId);
 
   if (sendEmail) {
     // Would send welcome email here
@@ -296,7 +273,7 @@ export async function loader({ params, request, url }: Route.LoaderArgs) {
 
   const mode = url.searchParams.get("mode");
 
-  const enrolled = isUserEnrolled(currentUserId, course.id);
+  const enrolled = isEnrolled(currentUserId, course.id);
 
   if (enrolled && mode !== "team") {
     throw redirect(`/courses/${slug}?already_enrolled=1`);
@@ -308,7 +285,7 @@ export async function loader({ params, request, url }: Route.LoaderArgs) {
   }
 
   const lessonCount = getLessonCountForCourse(course.id);
-  const enrollmentCount = getEnrollmentCountForCourse(course.id);
+  const enrollmentCount = countEnrollmentsForCourse(course.id);
 
   const totalDuration = courseWithDetails.modules.reduce(
     (sum, mod) =>
@@ -364,7 +341,7 @@ export async function action({ params, request }: Route.ActionArgs) {
     : course.price;
 
   if (parsed.data.intent === "confirm-purchase") {
-    if (isUserEnrolled(currentUserId, course.id)) {
+    if (isEnrolled(currentUserId, course.id)) {
       throw redirect(`/courses/${slug}`);
     }
     createPurchase(currentUserId, course.id, pppPrice, country);

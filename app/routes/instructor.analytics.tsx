@@ -19,6 +19,7 @@ import {
 } from "drizzle-orm";
 import { alias, type SQLiteColumn } from "drizzle-orm/sqlite-core";
 import { db } from "~/db";
+import { activeEnrollments } from "~/lib/enrollments.server";
 import {
   CourseStatus,
   LessonProgressStatus,
@@ -27,7 +28,6 @@ import {
   courseRatings,
   courses,
   coupons,
-  enrollments,
   lessonProgress,
   lessons,
   modules,
@@ -236,12 +236,13 @@ function getStudentRevenue(
   instructorId: number | null,
   range: AnalyticsRange
 ): StudentRevenue[] {
+  const active = activeEnrollments();
   const students = db
     .selectDistinct({ userId: users.id, name: users.name })
-    .from(enrollments)
-    .innerJoin(courses, eq(enrollments.courseId, courses.id))
-    .innerJoin(users, eq(users.id, enrollments.userId))
-    .where(scopeOn(enrollments.enrolledAt, instructorId, range))
+    .from(active)
+    .innerJoin(courses, eq(active.courseId, courses.id))
+    .innerJoin(users, eq(users.id, active.userId))
+    .where(scopeOn(active.enrolledAt, instructorId, range))
     .orderBy(users.name)
     .all();
 
@@ -359,12 +360,13 @@ function getTopBuyers(
 
   // No range here: "never enrolled" is a fact about the person, not about the
   // last thirty days.
+  const active = activeEnrollments();
   const enrolled = new Set(
     db
-      .selectDistinct({ userId: enrollments.userId })
-      .from(enrollments)
-      .innerJoin(courses, eq(enrollments.courseId, courses.id))
-      .where(and(inArray(enrollments.userId, buyerIds), ownedBy(instructorId)))
+      .selectDistinct({ userId: active.userId })
+      .from(active)
+      .innerJoin(courses, eq(active.courseId, courses.id))
+      .where(and(inArray(active.userId, buyerIds), ownedBy(instructorId)))
       .all()
       .map((row) => row.userId)
   );
@@ -494,22 +496,23 @@ function getCourseProgressSummary(courseId: number): CourseProgressSummary {
 
   // One grouped row per enrollee, including the ones who never started: a
   // student who bought and vanished is the finding, so a left join keeps them.
+  const active = activeEnrollments();
   const perStudent = db
     .select({
-      userId: enrollments.userId,
+      userId: active.userId,
       completed: countDistinct(lessonProgress.lessonId),
     })
-    .from(enrollments)
+    .from(active)
     .leftJoin(
       lessonProgress,
       and(
-        eq(lessonProgress.userId, enrollments.userId),
+        eq(lessonProgress.userId, active.userId),
         eq(lessonProgress.status, LessonProgressStatus.Completed),
         inArray(lessonProgress.lessonId, courseLessonIds(courseId))
       )
     )
-    .where(eq(enrollments.courseId, courseId))
-    .groupBy(enrollments.userId)
+    .where(eq(active.courseId, courseId))
+    .groupBy(active.userId)
     .all();
 
   if (perStudent.length === 0 || totalLessons === 0) {
@@ -543,10 +546,11 @@ const REACHED_STATUSES = [
 ];
 
 function getCourseDropOff(courseId: number): CourseFunnel {
+  const active = activeEnrollments();
   const enrolled = db
-    .select({ enrolledCount: countDistinct(enrollments.userId) })
-    .from(enrollments)
-    .where(eq(enrollments.courseId, courseId))
+    .select({ enrolledCount: countDistinct(active.userId) })
+    .from(active)
+    .where(eq(active.courseId, courseId))
     .get();
 
   const enrolledCount = enrolled?.enrolledCount ?? 0;
@@ -580,10 +584,10 @@ function getCourseDropOff(courseId: number): CourseFunnel {
     })
     .from(lessonProgress)
     .innerJoin(
-      enrollments,
+      active,
       and(
-        eq(enrollments.userId, lessonProgress.userId),
-        eq(enrollments.courseId, courseId)
+        eq(active.userId, lessonProgress.userId),
+        eq(active.courseId, courseId)
       )
     )
     .where(

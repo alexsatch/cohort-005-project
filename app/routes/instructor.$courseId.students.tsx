@@ -7,12 +7,12 @@ import { Button } from "~/components/ui/button";
 import { AlertTriangle, ArrowLeft, Users, Award } from "lucide-react";
 import { data, isRouteErrorResponse } from "react-router";
 import { db } from "~/db";
+import { listEnrollmentsForCourse } from "~/lib/enrollments.server";
 import {
   modules,
   lessons,
   users,
   courses,
-  enrollments,
   quizzes,
   quizAttempts,
   lessonProgress,
@@ -26,19 +26,6 @@ function getUserById(id: number) {
 
 function getCourseById(id: number) {
   return db.select().from(courses).where(eq(courses.id, id)).get();
-}
-
-function getCourseEnrolledStudents(courseId: number) {
-  return db
-    .select({
-      enrollmentId: enrollments.id,
-      userId: enrollments.userId,
-      enrolledAt: enrollments.enrolledAt,
-      completedAt: enrollments.completedAt,
-    })
-    .from(enrollments)
-    .where(eq(enrollments.courseId, courseId))
-    .all();
 }
 
 function getQuizByLessonId(lessonId: number) {
@@ -183,7 +170,7 @@ export async function loader({ params, request }: Route.LoaderArgs) {
   }
 
   // Get all enrolled students
-  const enrolledStudents = getCourseEnrolledStudents(courseId);
+  const enrolledStudents = listEnrollmentsForCourse(courseId);
 
   // Get all lessons with quizzes for this course
   const courseModules = db
