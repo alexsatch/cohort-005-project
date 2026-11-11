@@ -41,6 +41,16 @@ function openDatabase(filename: string) {
 
 let instance: ReturnType<typeof drizzle<typeof schema>> | undefined;
 
+/**
+ * Test seam: point `db` at a different SQLite connection (e.g. a fresh
+ * in-memory database). Use `useTestDatabase` from `~/test/db` rather than
+ * calling this directly.
+ */
+export function replaceSqliteConnection(next: Database.Database) {
+  connection = next;
+  instance = undefined;
+}
+
 function getDb() {
   if (!instance) {
     instance = drizzle(getSqlite(), { schema });
