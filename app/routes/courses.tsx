@@ -2,6 +2,7 @@ import { Form, Link, useSearchParams, useNavigation, isRouteErrorResponse } from
 import type { Route } from "./+types/courses";
 import { db } from "~/db";
 import { listEnrolledCoursesForUser } from "~/lib/enrollments.server";
+import { getCourseRatingSummaries } from "~/lib/ratings.server";
 import {
   courses as coursesTable,
   categories as categoriesTable,
@@ -9,11 +10,10 @@ import {
   modules,
   lessons,
   lessonProgress,
-  courseRatings,
   CourseStatus,
   LessonProgressStatus,
 } from "~/db/schema";
-import { eq, like, and, or, sql, inArray } from "drizzle-orm";
+import { eq, like, and, or, sql } from "drizzle-orm";
 import { Card, CardContent, CardFooter, CardHeader } from "~/components/ui/card";
 import { Button } from "~/components/ui/button";
 import { Skeleton } from "~/components/ui/skeleton";
@@ -210,47 +210,6 @@ function getCompletedLessonCount(userId: number, courseId: number) {
     .get();
 
   return result?.count ?? 0;
-}
-
-type CourseRatingSummary = {
-  average: number | null;
-  count: number;
-};
-
-const EMPTY_SUMMARY: CourseRatingSummary = { average: null, count: 0 };
-
-function getCourseRatingSummaries(
-  courseIds: number[]
-): Map<number, CourseRatingSummary> {
-  const summaries = new Map<number, CourseRatingSummary>();
-
-  if (courseIds.length === 0) return summaries;
-
-  const rows = db
-    .select({
-      courseId: courseRatings.courseId,
-      average: sql<number | null>`avg(${courseRatings.rating})`,
-      count: sql<number>`count(*)`,
-    })
-    .from(courseRatings)
-    .where(inArray(courseRatings.courseId, courseIds))
-    .groupBy(courseRatings.courseId)
-    .all();
-
-  for (const row of rows) {
-    summaries.set(row.courseId, {
-      average: row.average === null ? null : Math.round(row.average * 10) / 10,
-      count: row.count,
-    });
-  }
-
-  for (const courseId of courseIds) {
-    if (!summaries.has(courseId)) {
-      summaries.set(courseId, EMPTY_SUMMARY);
-    }
-  }
-
-  return summaries;
 }
 
 export function meta() {

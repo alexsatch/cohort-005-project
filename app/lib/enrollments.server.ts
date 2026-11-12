@@ -1,4 +1,14 @@
-import { and, eq, isNotNull, isNull, sql } from "drizzle-orm";
+import {
+  and,
+  eq,
+  exists,
+  isNotNull,
+  isNull,
+  notExists,
+  sql,
+  type SQL,
+} from "drizzle-orm";
+import type { SQLiteColumn } from "drizzle-orm/sqlite-core";
 import { db } from "~/db";
 import { courses, enrollments } from "~/db/schema";
 
@@ -37,6 +47,33 @@ export function activeEnrollments() {
     .from(enrollments)
     .where(activeEnrollmentsWhere())
     .as("active_enrollments");
+}
+
+/**
+ * A condition for queries over other tables: true when the learner in
+ * `userId` has only a Suspended Enrollment in the course in `courseId` — one
+ * that is suspended, and none that counts. Pass the outer query's columns.
+ */
+export function onlySuspendedEnrollment(
+  userId: SQLiteColumn,
+  courseId: SQLiteColumn
+): SQL {
+  const enrollmentsOf = (condition: SQL) =>
+    db
+      .select({ id: enrollments.id })
+      .from(enrollments)
+      .where(
+        and(
+          eq(enrollments.userId, userId),
+          eq(enrollments.courseId, courseId),
+          condition
+        )
+      );
+
+  return and(
+    exists(enrollmentsOf(isNotNull(enrollments.suspendedAt))),
+    notExists(enrollmentsOf(activeEnrollmentsWhere()))
+  )!;
 }
 
 export function findEnrollment(
