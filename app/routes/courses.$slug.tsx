@@ -6,6 +6,7 @@ import type { Route } from "./+types/courses.$slug";
 import { getCurrentUserId } from "~/lib/session";
 import { db } from "~/db";
 import { findSuspendedEnrollment, isEnrolled } from "~/lib/enrollments.server";
+import { findRating, getCourseRatingSummary } from "~/lib/ratings.server";
 import {
   courses,
   categories,
@@ -281,43 +282,6 @@ function getNextIncompleteLesson(userId: number, courseId: number) {
   }
 
   return null;
-}
-
-type CourseRatingSummary = {
-  average: number | null;
-  count: number;
-};
-
-const EMPTY_SUMMARY: CourseRatingSummary = { average: null, count: 0 };
-
-function findRating(userId: number, courseId: number) {
-  return db
-    .select()
-    .from(courseRatings)
-    .where(
-      and(eq(courseRatings.userId, userId), eq(courseRatings.courseId, courseId))
-    )
-    .get();
-}
-
-function getCourseRatingSummary(courseId: number): CourseRatingSummary {
-  const result = db
-    .select({
-      average: sql<number | null>`avg(${courseRatings.rating})`,
-      count: sql<number>`count(*)`,
-    })
-    .from(courseRatings)
-    .where(eq(courseRatings.courseId, courseId))
-    .get();
-
-  if (!result || result.count === 0 || result.average === null) {
-    return EMPTY_SUMMARY;
-  }
-
-  return {
-    average: Math.round(result.average * 10) / 10,
-    count: result.count,
-  };
 }
 
 function rateCourse(userId: number, courseId: number, rating: number) {

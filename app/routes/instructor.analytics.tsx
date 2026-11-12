@@ -20,6 +20,7 @@ import {
 import { alias, type SQLiteColumn } from "drizzle-orm/sqlite-core";
 import { db } from "~/db";
 import { activeEnrollments } from "~/lib/enrollments.server";
+import { getRatingSummary as getCountedRatingSummary } from "~/lib/ratings.server";
 import {
   CourseStatus,
   LessonProgressStatus,
@@ -387,21 +388,9 @@ function getRatingSummary(
   instructorId: number | null,
   range: AnalyticsRange
 ): RatingSummary {
-  const row = db
-    .select({
-      average: sql<number | null>`avg(${courseRatings.rating})`,
-      count: count(courseRatings.id),
-    })
-    .from(courseRatings)
-    .innerJoin(courses, eq(courseRatings.courseId, courses.id))
-    .where(scopeOn(courseRatings.createdAt, instructorId, range))
-    .get();
-
-  if (!row || row.count === 0 || row.average === null) {
-    return { average: null, count: 0 };
-  }
-
-  return { average: Math.round(row.average * 10) / 10, count: row.count };
+  return getCountedRatingSummary(
+    scopeOn(courseRatings.createdAt, instructorId, range)
+  );
 }
 
 /** The bucket an ISO timestamp falls in, at the given granularity. */
