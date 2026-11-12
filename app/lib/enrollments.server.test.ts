@@ -14,9 +14,11 @@ import {
   countEnrollmentsForCourse,
   enroll,
   findEnrollment,
+  findSuspendedEnrollment,
   isEnrolled,
   listEnrolledCoursesForUser,
   listEnrollmentsForCourse,
+  suspendEnrollment,
 } from "./enrollments.server";
 
 function createLearner(name: string) {
@@ -135,6 +137,50 @@ describe("enrollments", () => {
         courseId: course.id,
         completedAt: null,
       });
+    });
+
+    it("resumes the learner's Suspended Enrollment instead of creating another", () => {
+      const ada = createLearner("Ada");
+      const course = createCourse("typescript");
+      const original = insertEnrollment(
+        ada.id,
+        course.id,
+        "2026-01-01T00:00:00.000Z"
+      );
+      suspendEnrollment(ada.id, course.id);
+
+      const resumed = enroll(ada.id, course.id);
+
+      expect(isEnrolled(ada.id, course.id)).toBe(true);
+      expect(resumed).toMatchObject({
+        id: original.id,
+        enrolledAt: "2026-01-01T00:00:00.000Z",
+        suspendedAt: null,
+      });
+      expect(findSuspendedEnrollment(ada.id, course.id)).toBeUndefined();
+      expect(listEnrollmentsForCourse(course.id)).toEqual([
+        {
+          enrollmentId: original.id,
+          userId: ada.id,
+          enrolledAt: "2026-01-01T00:00:00.000Z",
+          completedAt: null,
+        },
+      ]);
+    });
+
+    it("leaves other learners' Suspended Enrollments suspended", () => {
+      const ada = createLearner("Ada");
+      const liam = createLearner("Liam");
+      const course = createCourse("typescript");
+      insertEnrollment(liam.id, course.id, "2026-01-01T00:00:00.000Z");
+      suspendEnrollment(liam.id, course.id);
+
+      const enrollment = enroll(ada.id, course.id);
+
+      expect(listEnrollmentsForCourse(course.id)).toMatchObject([
+        { enrollmentId: enrollment.id, userId: ada.id },
+      ]);
+      expect(findSuspendedEnrollment(liam.id, course.id)).toBeDefined();
     });
   });
 

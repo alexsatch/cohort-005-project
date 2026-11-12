@@ -103,8 +103,25 @@ export function countEnrollmentsForCourse(courseId: number): number {
   return result?.count ?? 0;
 }
 
-/** Enroll a learner in a course. Callers check they aren't enrolled first. */
+/**
+ * Enroll a learner in a course. Callers check they aren't enrolled first.
+ *
+ * A learner with a Suspended Enrollment gets that same Enrollment back,
+ * resumed with its original enrolment date and all their progress — getting
+ * the course again never creates a second Enrollment (ADR 0001).
+ */
 export function enroll(userId: number, courseId: number): Enrollment {
+  const suspended = findSuspendedEnrollment(userId, courseId);
+
+  if (suspended) {
+    return db
+      .update(enrollments)
+      .set({ suspendedAt: null })
+      .where(eq(enrollments.id, suspended.id))
+      .returning()
+      .get();
+  }
+
   return db.insert(enrollments).values({ userId, courseId }).returning().get();
 }
 

@@ -21,7 +21,7 @@ import {
   LessonProgressStatus,
   RefundStatus,
 } from "~/db/schema";
-import { eq, and, or, sql, inArray, isNotNull } from "drizzle-orm";
+import { eq, and, or, sql, inArray, isNotNull, gte } from "drizzle-orm";
 import { Card, CardContent, CardHeader } from "~/components/ui/card";
 import { Button } from "~/components/ui/button";
 import { Skeleton } from "~/components/ui/skeleton";
@@ -399,7 +399,13 @@ function getCompletedLessonCount(userId: number, lessonIds: number[]) {
   return result?.count ?? 0;
 }
 
-function getSecondsWatched(userId: number, lessonIds: number[]) {
+// Counts only watching since the purchase, so each purchase gets its own
+// watch-time check.
+function getSecondsWatched(
+  userId: number,
+  lessonIds: number[],
+  sinceIso: string
+) {
   if (lessonIds.length === 0) return 0;
 
   const furthestPerLesson = db
@@ -410,7 +416,8 @@ function getSecondsWatched(userId: number, lessonIds: number[]) {
     .where(
       and(
         eq(videoWatchEvents.userId, userId),
-        inArray(videoWatchEvents.lessonId, lessonIds)
+        inArray(videoWatchEvents.lessonId, lessonIds),
+        gte(videoWatchEvents.createdAt, sinceIso)
       )
     )
     .groupBy(videoWatchEvents.lessonId)
@@ -457,7 +464,7 @@ function getRefundOffer(userId: number, course: { id: number }) {
     }
   }
 
-  if (getSecondsWatched(userId, lessonIds) >= REFUND_WATCH_LIMIT_SECONDS) {
+  if (getSecondsWatched(userId, lessonIds, purchase.createdAt) >= REFUND_WATCH_LIMIT_SECONDS) {
     return null;
   }
 

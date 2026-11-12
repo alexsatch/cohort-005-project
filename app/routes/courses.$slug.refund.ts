@@ -14,7 +14,7 @@ import {
   videoWatchEvents,
   RefundStatus,
 } from "~/db/schema";
-import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, isNotNull, sql } from "drizzle-orm";
 import { parseFormData, parseParams } from "~/lib/validation";
 import { formatPrice } from "~/lib/utils";
 
@@ -181,7 +181,10 @@ export async function action({ params, request }: Route.ActionArgs) {
       .where(
         and(
           eq(videoWatchEvents.userId, currentUserId),
-          inArray(videoWatchEvents.lessonId, courseLessonIds)
+          inArray(videoWatchEvents.lessonId, courseLessonIds),
+          // Each purchase gets its own watch-time check: watching done under
+          // an earlier, refunded purchase does not count against this one.
+          gte(videoWatchEvents.createdAt, purchase.createdAt)
         )
       )
       .groupBy(videoWatchEvents.lessonId)
