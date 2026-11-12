@@ -17,6 +17,7 @@ import {
   isEnrolled,
   listEnrolledCoursesForUser,
   listEnrollmentsForCourse,
+  suspendEnrollment,
 } from "./enrollments.server";
 
 function createLearner(name: string) {
@@ -201,6 +202,21 @@ describe("enrollments", () => {
     });
   });
 
+  describe("listEnrollmentsForCourse with a Suspended Enrollment", () => {
+    it("leaves the suspended learner out of the course's student list", () => {
+      const ada = createLearner("Ada");
+      const liam = createLearner("Liam");
+      const typescript = createCourse("typescript");
+      insertEnrollment(ada.id, typescript.id, "2026-01-01T00:00:00.000Z");
+      insertEnrollment(liam.id, typescript.id, "2026-01-02T00:00:00.000Z");
+      suspendEnrollment(ada.id, typescript.id);
+
+      expect(
+        listEnrollmentsForCourse(typescript.id).map((row) => row.userId)
+      ).toEqual([liam.id]);
+    });
+  });
+
   describe("countEnrollmentsForCourse", () => {
     it("counts the course's Enrollments", () => {
       const ada = createLearner("Ada");
@@ -212,6 +228,17 @@ describe("enrollments", () => {
       insertEnrollment(ada.id, react.id, "2026-01-03T00:00:00.000Z");
 
       expect(countEnrollmentsForCourse(typescript.id)).toBe(2);
+    });
+
+    it("leaves out a Suspended Enrollment", () => {
+      const ada = createLearner("Ada");
+      const liam = createLearner("Liam");
+      const typescript = createCourse("typescript");
+      insertEnrollment(ada.id, typescript.id, "2026-01-01T00:00:00.000Z");
+      insertEnrollment(liam.id, typescript.id, "2026-01-02T00:00:00.000Z");
+      suspendEnrollment(ada.id, typescript.id);
+
+      expect(countEnrollmentsForCourse(typescript.id)).toBe(1);
     });
 
     it("is zero for a course nobody is enrolled in", () => {
