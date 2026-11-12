@@ -13,7 +13,11 @@ import {
   approveRefundRequest,
   declineRefundRequest,
   getRefundRequestDetail,
+  markRefundFailed,
+  markRefundIssued,
+  retryRefund,
   type RefundRequestAuditEntry,
+  type RefundStepRejection,
 } from "~/lib/refund-requests.server";
 import { parseFormData, parseParams } from "~/lib/validation";
 import { formatPrice } from "~/lib/utils";
@@ -45,7 +49,7 @@ export async function loader({ params, request }: Route.LoaderArgs) {
 }
 
 const refundRequestIntentSchema = z.object({
-  intent: z.enum(["approve", "decline"]),
+  intent: z.enum(["approve", "decline", "mark-issued", "mark-failed", "retry"]),
 });
 
 export async function action({ params, request }: Route.ActionArgs) {
@@ -58,6 +62,38 @@ export async function action({ params, request }: Route.ActionArgs) {
 
   if (!intent.success) {
     throw data("Invalid action.", { status: 400 });
+  }
+
+  const moneyInput = { note: formData.get("note") };
+
+  switch (intent.data.intent) {
+    case "mark-issued": {
+      const result = markRefundIssued(id, userId, moneyInput);
+      if (result.outcome !== "issued") return refundStepRejected(result);
+      return {
+        ok: true as const,
+        errors: null,
+        message: "Refund marked as sent. The buyer has been emailed.",
+      };
+    }
+    case "mark-failed": {
+      const result = markRefundFailed(id, userId, moneyInput);
+      if (result.outcome !== "failed") return refundStepRejected(result);
+      return {
+        ok: true as const,
+        errors: null,
+        message: "Refund marked as failed.",
+      };
+    }
+    case "retry": {
+      const result = retryRefund(id, userId, moneyInput);
+      if (result.outcome !== "retried") return refundStepRejected(result);
+      return {
+        ok: true as const,
+        errors: null,
+        message: "Refund is pending again, ready to be sent.",
+      };
+    }
   }
 
   if (intent.data.intent === "approve") {
@@ -106,6 +142,16 @@ export async function action({ params, request }: Route.ActionArgs) {
 
 function alreadyDecidedResponse(message: string) {
   return data({ ok: false as const, errors: null, message }, { status: 409 });
+}
+
+function refundStepRejected(rejection: RefundStepRejection) {
+  if (rejection.outcome === "invalid") {
+    return data(
+      { ok: false as const, errors: rejection.errors, message: null },
+      { status: 400 }
+    );
+  }
+  return alreadyDecidedResponse(rejection.notAllowed.message);
 }
 
 function formatDate(iso: string) {
@@ -230,6 +276,98 @@ const MONEY_STATUS_LABELS: Record<RefundMoneyStatus, string> = {
   [RefundMoneyStatus.Issued]: "Issued",
   [RefundMoneyStatus.Failed]: "Failed",
 };
+
+type RefundMoneyIntent = "mark-issued" | "mark-failed" | "retry";
+
+// The steps an admin can take from each money state. Issued is final.
+const MONEY_ACTIONS: Record<
+  RefundMoneyStatus,
+  {
+    intent: RefundMoneyIntent;
+    label: string;
+    busyLabel: string;
+    destructive: boolean;
+  }[]
+> = {
+  [RefundMoneyStatus.Pending]: [
+    {
+      intent: "mark-issued",
+      label: "Mark as sent",
+      busyLabel: "Marking as sent…",
+      destructive: false,
+    },
+    {
+      intent: "mark-failed",
+      label: "Mark as failed",
+      busyLabel: "Marking as failed…",
+      destructive: true,
+    },
+  ],
+  [RefundMoneyStatus.Failed]: [
+    {
+      intent: "retry",
+      label: "Retry",
+      busyLabel: "Retrying…",
+      destructive: false,
+    },
+  ],
+  [RefundMoneyStatus.Issued]: [],
+};
+
+function RefundMoneyForm({ status }: { status: RefundMoneyStatus }) {
+  const fetcher = useFetcher<typeof action>();
+  const [note, setNote] = useState("");
+  const noteError =
+    fetcher.state === "idle" ? fetcher.data?.errors?.note : undefined;
+  const submittingIntent = fetcher.formData?.get("intent");
+
+  useEffect(() => {
+    if (fetcher.state !== "idle" || !fetcher.data) return;
+    if (fetcher.data.ok) {
+      toast.success(fetcher.data.message);
+      setNote("");
+    } else if (fetcher.data.message) {
+      toast.error(fetcher.data.message);
+    }
+  }, [fetcher.state, fetcher.data]);
+
+  const actions = MONEY_ACTIONS[status];
+  if (actions.length === 0) return null;
+
+  return (
+    <fetcher.Form method="post" className="mt-6 space-y-3 border-t pt-6">
+      <div className="space-y-2">
+        <Label htmlFor="refund-note">Note (optional)</Label>
+        <Textarea
+          id="refund-note"
+          name="note"
+          value={note}
+          onChange={(event) => setNote(event.target.value)}
+          placeholder="For the audit trail, such as a bank transfer reference."
+          aria-invalid={noteError ? true : undefined}
+          rows={2}
+        />
+        {noteError && <p className="text-sm text-destructive">{noteError}</p>}
+      </div>
+      <div className="flex flex-wrap gap-3">
+        {actions.map((moneyAction) => (
+          <Button
+            key={moneyAction.intent}
+            type="submit"
+            name="intent"
+            value={moneyAction.intent}
+            variant={moneyAction.destructive ? "destructive" : "default"}
+            disabled={fetcher.state !== "idle"}
+          >
+            {submittingIntent === moneyAction.intent
+              ? moneyAction.busyLabel
+              : moneyAction.label}
+          </Button>
+        ))}
+      </div>
+    </fetcher.Form>
+  );
+}
 
 function AuditTrail({ entries }: { entries: RefundRequestAuditEntry[] }) {
   if (entries.length === 0) {
@@ -383,6 +521,7 @@ export default function AdminRefundRequest({
                   {formatPrice(refundRequest.refund.amount)}
                 </Field>
               </dl>
+              <RefundMoneyForm status={refundRequest.refund.status} />
             </CardContent>
           </Card>
         )}

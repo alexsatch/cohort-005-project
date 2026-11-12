@@ -35,7 +35,10 @@ import {
   getRefundRequestAuditTrail,
   getRefundRequestDetail,
   listRefundRequests,
+  markRefundFailed,
+  markRefundIssued,
   parseRefundRequestFilter,
+  retryRefund,
 } from "./refund-requests.server";
 
 useTestDatabase();
@@ -776,6 +779,298 @@ describe("approveRefundRequest", () => {
     const ada = createUser("Ada", UserRole.Admin);
     expect(() => approveRefundRequest(999, ada.id, {}, decidedAt)).toThrow(
       expect.objectContaining({ init: { status: 404 } })
+    );
+  });
+});
+
+describe("tracking the money of a Refund", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const approvedAt = new Date("2026-01-05T09:30:00.000Z");
+  const stepAt = new Date("2026-01-06T11:00:00.000Z");
+
+  function setUpApproved() {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const { liam, course } = seedBasics();
+    const ada = createUser("Ada", UserRole.Admin);
+    enroll(liam.id, course.id);
+    const purchase = createPurchase(liam.id, course.id, 7900);
+    const request = createRefundRequest(purchase.id);
+    approveRefundRequest(request.id, ada.id, {}, approvedAt);
+    const log = vi.mocked(console.log);
+    log.mockClear();
+    return { liam, course, ada, request, log };
+  }
+
+  function moneyStatus(id: number) {
+    return getRefundRequestDetail(id)?.refund?.status;
+  }
+
+  function expectStillApprovedAndSuspended(
+    id: number,
+    liamId: number,
+    courseId: number
+  ) {
+    expect(getRefundRequestDetail(id)?.status).toBe(RefundStatus.Approved);
+    expect(isEnrolled(liamId, courseId)).toBe(false);
+    expect(findSuspendedEnrollment(liamId, courseId)).toBeDefined();
+  }
+
+  describe("markRefundIssued", () => {
+    it("moves a Pending Refund to Issued and records the step with its note", () => {
+      const { ada, request } = setUpApproved();
+
+      const result = markRefundIssued(
+        request.id,
+        ada.id,
+        { note: "  Bank ref 12345  " },
+        stepAt
+      );
+
+      expect(result.outcome).toBe("issued");
+      expect(moneyStatus(request.id)).toBe(RefundMoneyStatus.Issued);
+      expect(getRefundRequestAuditTrail(request.id).at(-1)).toEqual({
+        id: expect.any(Number),
+        type: RefundRequestEventType.RefundIssued,
+        note: "Bank ref 12345",
+        createdAt: "2026-01-06T11:00:00.000Z",
+        actor: { id: ada.id, name: "Ada" },
+      });
+    });
+
+    it("emails the buyer that the money was sent, with the amount and course", () => {
+      const { ada, request, log } = setUpApproved();
+
+      const result = markRefundIssued(request.id, ada.id, {}, stepAt);
+
+      if (result.outcome !== "issued") throw new Error(result.outcome);
+      expect(result.email.to).toBe("liam@example.com");
+      expect(result.email.subject).toContain("Introduction to TypeScript");
+      expect(result.email.body).toContain("sent");
+      expect(result.email.body).toContain("$79");
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith(
+        expect.stringContaining("liam@example.com")
+      );
+    });
+
+    it("needs no note", () => {
+      const { ada, request } = setUpApproved();
+
+      markRefundIssued(request.id, ada.id, { note: "" }, stepAt);
+
+      expect(getRefundRequestAuditTrail(request.id).at(-1)).toMatchObject({
+        type: RefundRequestEventType.RefundIssued,
+        note: null,
+      });
+    });
+
+    it("returns a field error for an overlong note and changes nothing", () => {
+      const { ada, request } = setUpApproved();
+
+      const result = markRefundIssued(
+        request.id,
+        ada.id,
+        { note: "x".repeat(1001) },
+        stepAt
+      );
+
+      expect(result).toMatchObject({
+        outcome: "invalid",
+        errors: { note: expect.any(String) },
+      });
+      expect(moneyStatus(request.id)).toBe(RefundMoneyStatus.Pending);
+      expect(getRefundRequestAuditTrail(request.id)).toHaveLength(1);
+    });
+
+    it("throws a 404 for a Refund Request that does not exist", () => {
+      const ada = createUser("Ada", UserRole.Admin);
+      expect(() => markRefundIssued(999, ada.id, {}, stepAt)).toThrow(
+        expect.objectContaining({ init: { status: 404 } })
+      );
+    });
+  });
+
+  describe("markRefundFailed", () => {
+    it("moves a Pending Refund to Failed, records the step and emails no one", () => {
+      const { ada, request, log } = setUpApproved();
+
+      const result = markRefundFailed(
+        request.id,
+        ada.id,
+        { note: "Account closed." },
+        stepAt
+      );
+
+      expect(result).toEqual({ outcome: "failed" });
+      expect(moneyStatus(request.id)).toBe(RefundMoneyStatus.Failed);
+      expect(getRefundRequestAuditTrail(request.id).at(-1)).toMatchObject({
+        type: RefundRequestEventType.RefundFailed,
+        note: "Account closed.",
+        actor: { id: ada.id },
+      });
+      expect(log).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("retryRefund", () => {
+    it("moves a Failed Refund back to Pending, records the step and emails no one", () => {
+      const { ada, request, log } = setUpApproved();
+      markRefundFailed(request.id, ada.id, {}, stepAt);
+
+      const result = retryRefund(
+        request.id,
+        ada.id,
+        { note: "New account details." },
+        stepAt
+      );
+
+      expect(result).toEqual({ outcome: "retried" });
+      expect(moneyStatus(request.id)).toBe(RefundMoneyStatus.Pending);
+      expect(getRefundRequestAuditTrail(request.id).at(-1)).toMatchObject({
+        type: RefundRequestEventType.RefundRetried,
+        note: "New account details.",
+      });
+      expect(log).not.toHaveBeenCalled();
+    });
+
+    it("lets the money be sent after a retry", () => {
+      const { ada, request } = setUpApproved();
+      markRefundFailed(request.id, ada.id, {}, stepAt);
+      retryRefund(request.id, ada.id, {}, stepAt);
+
+      expect(markRefundIssued(request.id, ada.id, {}, stepAt).outcome).toBe(
+        "issued"
+      );
+      expect(
+        getRefundRequestAuditTrail(request.id).map((entry) => entry.type)
+      ).toEqual([
+        RefundRequestEventType.Approved,
+        RefundRequestEventType.RefundFailed,
+        RefundRequestEventType.RefundRetried,
+        RefundRequestEventType.RefundIssued,
+      ]);
+    });
+  });
+
+  describe("illegal steps", () => {
+    const steps = {
+      markRefundIssued,
+      markRefundFailed,
+      retryRefund,
+    } as const;
+
+    it.each([
+      ["Issued", "markRefundIssued", "issued"],
+      ["Issued", "markRefundFailed", "issued"],
+      ["Issued", "retryRefund", "issued"],
+      ["Failed", "markRefundIssued", "failed"],
+      ["Failed", "markRefundFailed", "failed"],
+      ["Pending", "retryRefund", "pending"],
+    ] as const)(
+      "rejects %s → %s and changes nothing",
+      (from, stepName, current) => {
+        const { ada, request, log } = setUpApproved();
+        if (from === "Issued") markRefundIssued(request.id, ada.id, {}, stepAt);
+        if (from === "Failed") markRefundFailed(request.id, ada.id, {}, stepAt);
+        const trailBefore = getRefundRequestAuditTrail(request.id);
+        const statusBefore = moneyStatus(request.id);
+        log.mockClear();
+
+        const result = steps[stepName](request.id, ada.id, {}, stepAt);
+
+        expect(result).toEqual({
+          outcome: "not-allowed",
+          notAllowed: {
+            moneyStatus: current,
+            message: `The Refund is already marked ${current}.`,
+          },
+        });
+        expect(moneyStatus(request.id)).toBe(statusBefore);
+        expect(getRefundRequestAuditTrail(request.id)).toEqual(trailBefore);
+        expect(log).not.toHaveBeenCalled();
+      }
+    );
+
+    it.each([RefundStatus.Open, RefundStatus.Declined])(
+      "rejects any step on a %s Refund Request, which has no Refund",
+      (status) => {
+        const { liam, course } = seedBasics();
+        const ada = createUser("Ada", UserRole.Admin);
+        const purchase = createPurchase(liam.id, course.id, 7900);
+        const request = createRefundRequest(purchase.id, status);
+
+        for (const step of Object.values(steps)) {
+          expect(step(request.id, ada.id, {}, stepAt)).toMatchObject({
+            outcome: "not-allowed",
+            notAllowed: { moneyStatus: null },
+          });
+        }
+        expect(getRefundRequestDetail(request.id)).toMatchObject({
+          status,
+          refund: null,
+        });
+        expect(getRefundRequestAuditTrail(request.id)).toEqual([]);
+      }
+    );
+  });
+
+  describe("concurrent steps", () => {
+    it("first wins: the second admin is told it is already marked, and nothing is written for them", () => {
+      const { ada, request, log } = setUpApproved();
+      const bob = createUser("Bob", UserRole.Admin);
+      // Both admins saw a Pending Refund; Ada's click lands first.
+      markRefundIssued(request.id, ada.id, { note: "Ref A" }, stepAt);
+      log.mockClear();
+
+      const result = markRefundFailed(
+        request.id,
+        bob.id,
+        { note: "Ref B" },
+        stepAt
+      );
+
+      expect(result).toMatchObject({
+        outcome: "not-allowed",
+        notAllowed: { message: "The Refund is already marked issued." },
+      });
+      expect(moneyStatus(request.id)).toBe(RefundMoneyStatus.Issued);
+      expect(getRefundRequestAuditTrail(request.id)).toMatchObject([
+        { type: RefundRequestEventType.Approved },
+        { type: RefundRequestEventType.RefundIssued, actor: { id: ada.id } },
+      ]);
+      expect(log).not.toHaveBeenCalled();
+    });
+
+    it("sends the Issued email only once when two admins mark it sent", () => {
+      const { ada, request, log } = setUpApproved();
+      const bob = createUser("Bob", UserRole.Admin);
+
+      markRefundIssued(request.id, ada.id, {}, stepAt);
+      const second = markRefundIssued(request.id, bob.id, {}, stepAt);
+
+      expect(second.outcome).toBe("not-allowed");
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(getRefundRequestAuditTrail(request.id)).toHaveLength(2);
+    });
+  });
+
+  it("keeps the Refund Request Approved and the Enrollment suspended through every money state", () => {
+    const { ada, liam, course, request } = setUpApproved();
+    expectStillApprovedAndSuspended(request.id, liam.id, course.id);
+
+    markRefundFailed(request.id, ada.id, {}, stepAt);
+    expectStillApprovedAndSuspended(request.id, liam.id, course.id);
+
+    retryRefund(request.id, ada.id, {}, stepAt);
+    expectStillApprovedAndSuspended(request.id, liam.id, course.id);
+
+    markRefundIssued(request.id, ada.id, {}, stepAt);
+    expectStillApprovedAndSuspended(request.id, liam.id, course.id);
+    expect(findSuspendedEnrollment(liam.id, course.id)?.suspendedAt).toBe(
+      "2026-01-05T09:30:00.000Z"
     );
   });
 });

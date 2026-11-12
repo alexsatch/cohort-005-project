@@ -7,6 +7,7 @@ import {
   CourseStatus,
   purchases,
   RefundMoneyStatus,
+  RefundRequestEventType,
   refunds,
   RefundStatus,
   users,
@@ -18,7 +19,11 @@ import {
   listRefundRequests,
 } from "~/lib/refund-requests.server";
 import { getAccess } from "~/lib/access.server";
-import { enroll } from "~/lib/enrollments.server";
+import {
+  enroll,
+  findSuspendedEnrollment,
+  isEnrolled,
+} from "~/lib/enrollments.server";
 import { setCurrentUserId } from "~/lib/session";
 import { useTestDatabase } from "~/test/db";
 import { action as refundRequestAction } from "./admin.refunds.$id";
@@ -113,6 +118,24 @@ function decline(userId: number, id: number, reason: string) {
 function approve(userId: number, id: number, note = "") {
   const url = `http://localhost/admin/refunds/${id}`;
   return postAs(userId, url, { intent: "approve", note }).then((request) =>
+    refundRequestAction({
+      request,
+      params: { id: String(id) },
+      context: new RouterContextProvider(),
+      url: new URL(url),
+      pattern: "/admin/refunds/:id",
+    })
+  );
+}
+
+function moneyStep(
+  userId: number,
+  id: number,
+  intent: "mark-issued" | "mark-failed" | "retry",
+  note = ""
+) {
+  const url = `http://localhost/admin/refunds/${id}`;
+  return postAs(userId, url, { intent, note }).then((request) =>
     refundRequestAction({
       request,
       params: { id: String(id) },
@@ -283,6 +306,129 @@ describe("declining from the admin detail page", () => {
     ).rejects.toMatchObject({ init: { status: 403 } });
     expect(getRefundRequestDetail(seeded.request.id)?.status).toBe(
       RefundStatus.Open
+    );
+  });
+});
+
+describe("tracking the money from the admin detail page", () => {
+  async function seedApproved() {
+    const seeded = seedOpenRefundRequest();
+    enroll(seeded.liam.id, seeded.course.id);
+    await approve(seeded.ada.id, seeded.request.id);
+    return seeded;
+  }
+
+  it("marks a Pending Refund as sent, with the note in the audit trail", async () => {
+    const { ada, request } = await seedApproved();
+
+    const result = await moneyStep(ada.id, request.id, "mark-issued", "Ref 42");
+
+    expect(result).toMatchObject({ ok: true });
+    expect(getRefundRequestDetail(request.id)).toMatchObject({
+      status: RefundStatus.Approved,
+      refund: { status: RefundMoneyStatus.Issued, amount: 7900 },
+    });
+    expect(getRefundRequestAuditTrail(request.id).at(-1)).toMatchObject({
+      type: RefundRequestEventType.RefundIssued,
+      note: "Ref 42",
+      actor: { id: ada.id },
+    });
+  });
+
+  it("marks a Pending Refund as failed, then retries it", async () => {
+    const { ada, liam, course, request } = await seedApproved();
+
+    expect(await moneyStep(ada.id, request.id, "mark-failed")).toMatchObject({
+      ok: true,
+    });
+    expect(getRefundRequestDetail(request.id)?.refund?.status).toBe(
+      RefundMoneyStatus.Failed
+    );
+
+    expect(await moneyStep(ada.id, request.id, "retry")).toMatchObject({
+      ok: true,
+    });
+    expect(getRefundRequestDetail(request.id)?.refund?.status).toBe(
+      RefundMoneyStatus.Pending
+    );
+    expect(isEnrolled(liam.id, course.id)).toBe(false);
+    expect(findSuspendedEnrollment(liam.id, course.id)).toBeDefined();
+  });
+
+  it("rejects a stale step with 409, saying where the Refund already is", async () => {
+    const { ada, request } = await seedApproved();
+    const bob = createUser("Bob", UserRole.Admin);
+    await moneyStep(ada.id, request.id, "mark-issued");
+
+    const result = await moneyStep(bob.id, request.id, "mark-failed");
+
+    expect(result).toMatchObject({
+      init: { status: 409 },
+      data: { ok: false, message: "The Refund is already marked issued." },
+    });
+    expect(getRefundRequestDetail(request.id)?.refund?.status).toBe(
+      RefundMoneyStatus.Issued
+    );
+    expect(getRefundRequestAuditTrail(request.id)).toHaveLength(2);
+  });
+
+  it("rejects a step on a request that has no Refund with 409", async () => {
+    const { ada, request } = seedOpenRefundRequest();
+
+    const result = await moneyStep(ada.id, request.id, "mark-issued");
+
+    expect(result).toMatchObject({ init: { status: 409 } });
+    expect(getRefundRequestDetail(request.id)).toMatchObject({
+      status: RefundStatus.Open,
+      refund: null,
+    });
+  });
+
+  it("returns a field error for an overlong note", async () => {
+    const { ada, request } = await seedApproved();
+
+    const result = await moneyStep(
+      ada.id,
+      request.id,
+      "mark-issued",
+      "x".repeat(1001)
+    );
+
+    expect(result).toMatchObject({
+      init: { status: 400 },
+      data: { errors: { note: expect.any(String) } },
+    });
+    expect(getRefundRequestDetail(request.id)?.refund?.status).toBe(
+      RefundMoneyStatus.Pending
+    );
+  });
+
+  it.each([
+    ["the buyer", "liam", "mark-issued"],
+    ["the buyer", "liam", "mark-failed"],
+    ["the course's owning instructor", "instructor", "mark-issued"],
+    ["the course's owning instructor", "instructor", "mark-failed"],
+  ] as const)("rejects %s with 403 on %s", async (_label, who, intent) => {
+    const seeded = await seedApproved();
+    const userId = who === "liam" ? seeded.liam.id : seeded.instructor.id;
+
+    await expect(
+      moneyStep(userId, seeded.request.id, intent)
+    ).rejects.toMatchObject({ init: { status: 403 } });
+    expect(getRefundRequestDetail(seeded.request.id)?.refund?.status).toBe(
+      RefundMoneyStatus.Pending
+    );
+  });
+
+  it("rejects a non-admin with 403 on retry", async () => {
+    const seeded = await seedApproved();
+    await moneyStep(seeded.ada.id, seeded.request.id, "mark-failed");
+
+    await expect(
+      moneyStep(seeded.liam.id, seeded.request.id, "retry")
+    ).rejects.toMatchObject({ init: { status: 403 } });
+    expect(getRefundRequestDetail(seeded.request.id)?.refund?.status).toBe(
+      RefundMoneyStatus.Failed
     );
   });
 });

@@ -647,3 +647,270 @@ function isTeamPurchase(tx: Transaction, purchaseId: number): boolean {
 
   return seat !== undefined;
 }
+
+// ─── Tracking the money ───
+// There is no payment provider yet, so admins move a Refund through its money
+// states by hand. Each step is its own function, so a provider can call the
+// same ones later. The Refund Request stays Approved and the Enrollment stays
+// suspended throughout: only the money state moves.
+//
+//   Pending ──issued──▶ Issued
+//   Pending ──failed──▶ Failed ──retried──▶ Pending
+
+type RefundMoneyTransition = {
+  from: RefundMoneyStatus;
+  to: RefundMoneyStatus;
+  event: RefundRequestEventType;
+};
+
+const MARK_ISSUED: RefundMoneyTransition = {
+  from: RefundMoneyStatus.Pending,
+  to: RefundMoneyStatus.Issued,
+  event: RefundRequestEventType.RefundIssued,
+};
+
+const MARK_FAILED: RefundMoneyTransition = {
+  from: RefundMoneyStatus.Pending,
+  to: RefundMoneyStatus.Failed,
+  event: RefundRequestEventType.RefundFailed,
+};
+
+const RETRY: RefundMoneyTransition = {
+  from: RefundMoneyStatus.Failed,
+  to: RefundMoneyStatus.Pending,
+  event: RefundRequestEventType.RefundRetried,
+};
+
+export type RefundNotAllowed = {
+  /** Where the Refund's money stands now; null when there is no Refund. */
+  moneyStatus: RefundMoneyStatus | null;
+  message: string;
+};
+
+function describeRefundMoney(refundRequestId: number): RefundNotAllowed {
+  const row = db
+    .select({ moneyStatus: refunds.moneyStatus })
+    .from(refunds)
+    .where(eq(refunds.id, refundRequestId))
+    .get();
+
+  const moneyStatus = row?.moneyStatus ?? null;
+
+  return {
+    moneyStatus,
+    message:
+      moneyStatus == null
+        ? "This Refund Request has no Refund: it has not been approved."
+        : `The Refund is already marked ${moneyStatus}.`,
+  };
+}
+
+const refundStepSchema = z.object({
+  note: z
+    .string({ invalid_type_error: "The note must be text." })
+    .trim()
+    .max(1000, "Please keep the note under 1000 characters.")
+    .nullish()
+    .transform((note) => (note ? note : null)),
+});
+
+/** Why a money step didn't happen. Nothing is written in either case. */
+export type RefundStepRejection =
+  | { outcome: "invalid"; errors: Record<string, string> }
+  | { outcome: "not-allowed"; notAllowed: RefundNotAllowed };
+
+/**
+ * Moves a Refund's money state along one transition and records the step in
+ * the audit trail, but only if the Refund is still in the transition's
+ * `from` state. The change is a conditional update on the expected state, so
+ * of two admins clicking at once exactly one succeeds; the other is told
+ * where the Refund already is, and nothing is written for them. The same
+ * check rejects any step the state machine doesn't allow, including acting
+ * on a Refund Request that has no Refund. Throws 404 when there is no such
+ * Refund Request.
+ */
+function moveRefundMoney(
+  refundRequestId: number,
+  actorUserId: number,
+  transition: RefundMoneyTransition,
+  input: { note?: unknown },
+  now: Date
+): { outcome: "moved" } | RefundStepRejection {
+  const parsed = refundStepSchema.safeParse(input);
+
+  if (!parsed.success) {
+    const errors: Record<string, string> = {};
+    for (const [key, messages] of Object.entries(
+      parsed.error.flatten().fieldErrors
+    )) {
+      if (messages && messages.length > 0) errors[key] = messages[0];
+    }
+    return { outcome: "invalid", errors };
+  }
+
+  const exists = db
+    .select({ id: refunds.id })
+    .from(refunds)
+    .where(eq(refunds.id, refundRequestId))
+    .get();
+
+  if (!exists) {
+    throw data("Refund Request not found", { status: 404 });
+  }
+
+  const moved = db.transaction((tx) => {
+    const result = tx
+      .update(refunds)
+      .set({ moneyStatus: transition.to })
+      .where(
+        and(
+          eq(refunds.id, refundRequestId),
+          eq(refunds.status, RefundStatus.Approved),
+          eq(refunds.moneyStatus, transition.from)
+        )
+      )
+      .run();
+
+    if (result.changes === 0) return false;
+
+    recordRefundRequestEvent(
+      tx,
+      refundRequestId,
+      transition.event,
+      actorUserId,
+      parsed.data.note,
+      now
+    );
+    return true;
+  });
+
+  if (!moved) {
+    return {
+      outcome: "not-allowed",
+      notAllowed: describeRefundMoney(refundRequestId),
+    };
+  }
+
+  return { outcome: "moved" };
+}
+
+/**
+ * The email the buyer gets when their Refund is Issued. There is no mail
+ * transport wired up yet, so the built message goes to the server log.
+ */
+function buildRefundIssuedEmail(input: {
+  buyerName: string;
+  buyerEmail: string;
+  courseTitle: string;
+  amountRefunded: number;
+}) {
+  return {
+    to: input.buyerEmail,
+    subject: `Refund sent — ${input.courseTitle}`,
+    body: [
+      `Hi ${input.buyerName},`,
+      "",
+      `Your refund for "${input.courseTitle}" has been sent: ${formatPrice(input.amountRefunded)} is on its way back to you. Depending on your bank, it can take a few days to arrive.`,
+      "",
+      "— The Cadence team",
+    ].join("\n"),
+  };
+}
+
+export type MarkRefundIssuedResult =
+  | { outcome: "issued"; email: { to: string; subject: string; body: string } }
+  | RefundStepRejection;
+
+/**
+ * An admin confirms the money of a Pending Refund was sent: Pending → Issued,
+ * with an optional note such as a bank transfer reference. The buyer is
+ * emailed only when this call is the one that moved it. From any other state
+ * it is `not-allowed`. Throws 404 when there is no such Refund Request.
+ */
+export function markRefundIssued(
+  refundRequestId: number,
+  actorUserId: number,
+  input: { note?: unknown },
+  now: Date = new Date()
+): MarkRefundIssuedResult {
+  const step = moveRefundMoney(
+    refundRequestId,
+    actorUserId,
+    MARK_ISSUED,
+    input,
+    now
+  );
+  if (step.outcome !== "moved") return step;
+
+  const request = db
+    .select({
+      amountRefunded: refunds.amountRefunded,
+      amountPaid: purchases.amountPaid,
+      buyerName: users.name,
+      buyerEmail: users.email,
+      courseTitle: courses.title,
+    })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .innerJoin(users, eq(purchases.userId, users.id))
+    .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .where(eq(refunds.id, refundRequestId))
+    .get();
+
+  if (!request) {
+    throw data("Refund Request not found", { status: 404 });
+  }
+
+  const email = buildRefundIssuedEmail({
+    buyerName: request.buyerName,
+    buyerEmail: request.buyerEmail,
+    courseTitle: request.courseTitle,
+    amountRefunded: request.amountRefunded ?? request.amountPaid,
+  });
+
+  console.log(`[email] to=${email.to} subject=${email.subject}\n${email.body}`);
+
+  return { outcome: "issued", email };
+}
+
+export type MarkRefundFailedResult =
+  { outcome: "failed" } | RefundStepRejection;
+
+/**
+ * An admin records that the money of a Pending Refund couldn't be sent:
+ * Pending → Failed, with an optional note. The buyer is not emailed. From
+ * any other state it is `not-allowed`. Throws 404 when there is no such
+ * Refund Request.
+ */
+export function markRefundFailed(
+  refundRequestId: number,
+  actorUserId: number,
+  input: { note?: unknown },
+  now: Date = new Date()
+): MarkRefundFailedResult {
+  const step = moveRefundMoney(
+    refundRequestId,
+    actorUserId,
+    MARK_FAILED,
+    input,
+    now
+  );
+  return step.outcome === "moved" ? { outcome: "failed" } : step;
+}
+
+export type RetryRefundResult = { outcome: "retried" } | RefundStepRejection;
+
+/**
+ * An admin puts a Failed Refund back to Pending so the money can be sent
+ * again, with an optional note. The buyer is not emailed. From any other
+ * state it is `not-allowed`. Throws 404 when there is no such Refund Request.
+ */
+export function retryRefund(
+  refundRequestId: number,
+  actorUserId: number,
+  input: { note?: unknown },
+  now: Date = new Date()
+): RetryRefundResult {
+  const step = moveRefundMoney(refundRequestId, actorUserId, RETRY, input, now);
+  return step.outcome === "moved" ? { outcome: "retried" } : step;
+}
