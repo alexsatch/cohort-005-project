@@ -18,6 +18,10 @@ import {
   isEnrolled,
   type Enrollment,
 } from "~/lib/enrollments.server";
+import {
+  isVoidedTeamSeat,
+  VOIDED_TEAM_SEAT_MESSAGE,
+} from "~/lib/team-seats.server";
 
 function getCourseById(id: number) {
   return db.select().from(courses).where(eq(courses.id, id)).get();
@@ -43,6 +47,10 @@ function redeemCoupon(
 
   if (coupon.redeemedByUserId !== null) {
     return { ok: false, error: "Coupon has already been redeemed" };
+  }
+
+  if (isVoidedTeamSeat(coupon)) {
+    return { ok: false, error: VOIDED_TEAM_SEAT_MESSAGE };
   }
 
   if (isEnrolled(userId, coupon.courseId)) {

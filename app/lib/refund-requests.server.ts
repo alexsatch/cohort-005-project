@@ -4,6 +4,7 @@ import { and, asc, count, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import { db } from "~/db";
 import { formatPrice } from "~/lib/utils";
 import { suspendEnrollment } from "~/lib/enrollments.server";
+import { voidUnclaimedTeamSeats } from "~/lib/team-seats.server";
 import {
   coupons,
   courses,
@@ -608,8 +609,8 @@ export function approveRefundRequest(
 
     if (isTeamPurchase(tx, request.purchaseId)) {
       // A team purchase paid for Team Seats, not the buyer's own Enrollment,
-      // so no Enrollment is suspended. Voiding its unclaimed Team Seats is
-      // issue #13 and belongs here.
+      // so no Enrollment is suspended; its unclaimed Team Seats are voided.
+      voidUnclaimedTeamSeats(request.purchaseId, now, tx);
     } else {
       suspendEnrollment(request.buyerId, request.courseId, now, tx);
     }
